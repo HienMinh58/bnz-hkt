@@ -1,0 +1,420 @@
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
+
+from app.models import (
+    GeneratePersonasRequest,
+    GeneratePersonasResponse,
+    GeneratedPersona,
+    LegacyPersona,
+    DevelopmentDebug,
+    SimulationResultResponse,
+)
+from app.openai_client import generate_personas_with_openai, simulate_with_openai
+from app.persona_generation import build_mock_personas
+from app.personas import PERSONAS
+from app.scoring import build_mock_simulation
+
+
+app = FastAPI(title="Synthetic Customer Lab API")
+logger = logging.getLogger("synthetic_customer_lab")
+logging.basicConfig(level=logging.INFO)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/personas", response_model=list[LegacyPersona])
+def get_personas() -> list[LegacyPersona]:
+    return PERSONAS
+
+
+@app.post("/api/generate-personas", response_model=GeneratePersonasResponse)
+def generate_personas(request: GeneratePersonasRequest) -> GeneratePersonasResponse:
+    request_id = uuid4().hex
+    endpoint_started_at = time.perf_counter()
+    request_received_at = _utc_timestamp()
+    logger.info(
+        "generate_personas_request_received requestId=%s timestamp=%s "
+        "featureName=%r personaCount=%s",
+        request_id,
+        request_received_at,
+        request.featureName,
+        request.personaCount,
+    )
+
+    openai_started_at: float | None = None
+    try:
+        openai_started_at = time.perf_counter()
+        logger.info(
+            "generate_personas_openai_start requestId=%s timestamp=%s",
+            request_id,
+            _utc_timestamp(),
+        )
+        result = generate_personas_with_openai(
+            feature_name=request.featureName,
+            banking_message=request.bankingMessage,
+            target_customers=request.targetCustomers,
+            channel=request.channel,
+            send_timing=request.sendTiming,
+            persona_count=request.personaCount,
+            request_id=request_id,
+        )
+        openai_duration_ms = _duration_ms(openai_started_at)
+        duration_ms = _duration_ms(endpoint_started_at)
+        logger.info(
+            "generate_personas_openai_end requestId=%s timestamp=%s "
+            "openaiDurationMs=%s success=True personaNames=%s",
+            request_id,
+            _utc_timestamp(),
+            openai_duration_ms,
+            [persona.name for persona in result.personas],
+        )
+        logger.info(
+            "generate_personas_response_returned requestId=%s timestamp=%s "
+            "durationMs=%s success=True used_openai=%s fallback_reason=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            result.used_openai,
+            result.fallback_reason,
+        )
+        return result.model_copy(
+            update={"requestId": request_id, "durationMs": duration_ms}
+        )
+    except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
+        error = normalize_fallback_reason(exc)
+        if openai_started_at is not None:
+            logger.info(
+                "generate_personas_openai_end requestId=%s timestamp=%s "
+                "openaiDurationMs=%s success=False error=%r",
+                request_id,
+                _utc_timestamp(),
+                _duration_ms(openai_started_at),
+                error,
+            )
+        logger.exception(
+            "generate_personas_response_returned requestId=%s timestamp=%s "
+            "durationMs=%s success=False error=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            error,
+        )
+        raise HTTPException(
+            status_code=_openai_error_status(error),
+            detail={
+                "requestId": request_id,
+                "error": error,
+                "durationMs": duration_ms,
+            },
+        ) from exc
+
+
+@app.post("/api/run-simulation", response_model=SimulationResultResponse)
+async def run_simulation(
+    featureName: str = Form(...),
+    bankingMessage: str = Form(...),
+    targetCustomers: str = Form(...),
+    channel: str = Form(...),
+    sendTiming: str = Form(...),
+    personas: str = Form(...),
+    screenshot: UploadFile | None = File(default=None),
+) -> SimulationResultResponse:
+    request_id = uuid4().hex
+    generated_personas = _parse_personas(personas, request_id)
+    image_bytes = None
+    image_content_type = None
+    if screenshot is not None:
+        image_bytes = await screenshot.read()
+        image_content_type = screenshot.content_type
+    image_uploaded = image_bytes is not None
+    persona_names = [persona.name for persona in generated_personas]
+
+    _log_simulation_event(
+        request_id=request_id,
+        feature_name=featureName,
+        persona_names=persona_names,
+        image_uploaded=image_uploaded,
+        openai_called=False,
+        openai_succeeded=False,
+        used_openai=False,
+        fallback_reason=None,
+    )
+
+    try:
+        result = simulate_with_openai(
+            personas=generated_personas,
+            feature_name=featureName,
+            banking_message=bankingMessage,
+            target_customers=targetCustomers,
+            channel=channel,
+            send_timing=sendTiming,
+            image_bytes=image_bytes,
+            image_content_type=image_content_type,
+            request_id=request_id,
+        )
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=featureName,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=True,
+            used_openai=result.used_openai,
+            fallback_reason=result.fallback_reason,
+            openai_attempts=result.openaiAttempts,
+            openai_response_id=result.openaiResponseId,
+            post_processing_warning=result.postProcessingWarning,
+        )
+        return _with_development_debug(
+            result=result,
+            request_id=request_id,
+            image_uploaded=image_uploaded,
+            persona_names=persona_names,
+        )
+    except Exception as exc:
+        fallback_reason = normalize_fallback_reason(exc)
+        openai_attempts = getattr(exc, "attempts", None)
+        result = build_mock_simulation(
+            personas=generated_personas,
+            feature_name=featureName,
+            message=bankingMessage,
+            target_customers=targetCustomers,
+            channel=channel,
+            send_timing=sendTiming,
+            image_uploaded=image_uploaded,
+            fallback_reason=fallback_reason,
+        )
+        result = result.model_copy(update={"openaiAttempts": openai_attempts})
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=featureName,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=False,
+            used_openai=result.used_openai,
+            fallback_reason=fallback_reason,
+            openai_attempts=result.openaiAttempts,
+            openai_response_id=result.openaiResponseId,
+            post_processing_warning=result.postProcessingWarning,
+        )
+        return _with_development_debug(
+            result=result,
+            request_id=request_id,
+            image_uploaded=image_uploaded,
+            persona_names=persona_names,
+        )
+
+
+@app.post("/api/simulate", response_model=SimulationResultResponse)
+async def simulate_compatibility(
+    feature_name: str = Form(...),
+    message: str = Form(...),
+    target_customers: str = Form(...),
+    channel: str = Form(...),
+    send_timing: str = Form(...),
+    screenshot: UploadFile | None = File(default=None),
+) -> SimulationResultResponse:
+    request_id = uuid4().hex
+    personas = build_mock_personas(
+        feature_name=feature_name,
+        banking_message=message,
+        target_customers=target_customers,
+        channel=channel,
+        send_timing=send_timing,
+        persona_count=6,
+    )
+    image_bytes = None
+    image_content_type = None
+    if screenshot is not None:
+        image_bytes = await screenshot.read()
+        image_content_type = screenshot.content_type
+    image_uploaded = image_bytes is not None
+    persona_names = [persona.name for persona in personas]
+
+    try:
+        result = simulate_with_openai(
+            personas=personas,
+            feature_name=feature_name,
+            banking_message=message,
+            target_customers=target_customers,
+            channel=channel,
+            send_timing=send_timing,
+            image_bytes=image_bytes,
+            image_content_type=image_content_type,
+            request_id=request_id,
+        )
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=feature_name,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=True,
+            used_openai=result.used_openai,
+            fallback_reason=result.fallback_reason,
+            openai_attempts=result.openaiAttempts,
+            openai_response_id=result.openaiResponseId,
+            post_processing_warning=result.postProcessingWarning,
+        )
+        return _with_development_debug(
+            result=result,
+            request_id=request_id,
+            image_uploaded=image_uploaded,
+            persona_names=persona_names,
+        )
+    except Exception as exc:
+        fallback_reason = normalize_fallback_reason(exc)
+        openai_attempts = getattr(exc, "attempts", None)
+        result = build_mock_simulation(
+            personas=personas,
+            feature_name=feature_name,
+            message=message,
+            target_customers=target_customers,
+            channel=channel,
+            send_timing=send_timing,
+            image_uploaded=image_uploaded,
+            fallback_reason=fallback_reason,
+        )
+        result = result.model_copy(update={"openaiAttempts": openai_attempts})
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=feature_name,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=False,
+            used_openai=result.used_openai,
+            fallback_reason=fallback_reason,
+            openai_attempts=result.openaiAttempts,
+            openai_response_id=result.openaiResponseId,
+            post_processing_warning=result.postProcessingWarning,
+        )
+        return _with_development_debug(
+            result=result,
+            request_id=request_id,
+            image_uploaded=image_uploaded,
+            persona_names=persona_names,
+        )
+
+
+def _parse_personas(personas_json: str, request_id: str) -> list[GeneratedPersona]:
+    try:
+        raw = json.loads(personas_json)
+        return [GeneratedPersona.model_validate(item) for item in raw]
+    except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+        logger.exception(
+            "simulation_request_failed requestId=%s validation_error=%s",
+            request_id,
+            exc,
+        )
+        raise HTTPException(status_code=400, detail="Invalid personas payload") from exc
+
+
+def _with_development_debug(
+    result: SimulationResultResponse,
+    request_id: str,
+    image_uploaded: bool,
+    persona_names: list[str],
+) -> SimulationResultResponse:
+    raw_openai_result = result.rawOpenAIResult if is_development_mode() else None
+    debug = DevelopmentDebug(
+        requestId=request_id,
+        used_openai=result.used_openai,
+        fallback_reason=result.fallback_reason,
+        imageUploaded=image_uploaded,
+        personaCount=len(persona_names),
+        personaNames=persona_names,
+        hasRawOpenAIResult=result.rawOpenAIResult is not None,
+        openaiResponseId=result.openaiResponseId,
+        openaiAttempts=result.openaiAttempts,
+        postProcessingWarning=result.postProcessingWarning,
+        rawOpenAIResult=raw_openai_result,
+    )
+    return result.model_copy(update={"developmentDebug": debug})
+
+
+def is_development_mode() -> bool:
+    return os.getenv("APP_ENV", "development").lower() != "production"
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _duration_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _openai_error_status(error: str) -> int:
+    lower = error.lower()
+    if "timeout" in lower:
+        return 504
+    if "validation" in lower or "json_parse" in lower:
+        return 502
+    return 502
+
+
+def normalize_fallback_reason(exc: Exception) -> str:
+    message = str(exc)
+    lower = message.lower()
+    if "520" in message:
+        return f"openai_520: {message}"
+    if "timed out" in lower or "timeout" in lower:
+        return f"openai_timeout: {message}"
+    if "validation" in lower or "pydantic" in lower:
+        return f"schema_validation_error: {message}"
+    if "json" in lower:
+        return f"json_parse_error: {message}"
+    return message
+
+
+def _log_simulation_event(
+    request_id: str,
+    feature_name: str,
+    persona_names: list[str],
+    image_uploaded: bool,
+    openai_called: bool,
+    openai_succeeded: bool,
+    used_openai: bool,
+    fallback_reason: str | None,
+    openai_attempts: int | None = None,
+    openai_response_id: str | None = None,
+    post_processing_warning: str | None = None,
+) -> None:
+    logger.info(
+        "simulation_request requestId=%s featureName=%r personaCount=%s "
+        "personaNames=%s imageUploaded=%s openaiCalled=%s openaiSucceeded=%s "
+        "used_openai=%s fallback_reason=%r openaiAttempts=%s openaiResponseId=%r "
+        "postProcessingWarning=%r",
+        request_id,
+        feature_name,
+        len(persona_names),
+        persona_names,
+        image_uploaded,
+        openai_called,
+        openai_succeeded,
+        used_openai,
+        fallback_reason,
+        openai_attempts,
+        openai_response_id,
+        post_processing_warning,
+    )
