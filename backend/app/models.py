@@ -59,6 +59,95 @@ class GeneratePersonasResponse(StrictBaseModel):
     durationMs: int | None = None
 
 
+class AdAnalysisRequest(StrictBaseModel):
+    campaignName: str
+    advertisementCopy: str
+    channel: str
+    placement: str
+    campaignContext: str
+
+
+class AdAnalysisResponse(StrictBaseModel):
+    productType: str
+    offerAngle: str
+    likelyIntent: str
+    audienceCues: list[str]
+    behaviorSignals: list[str]
+    ambiguity: list[str]
+    audienceHypothesis: str
+    expectedCustomerAction: str
+    used_openai: bool
+    fallback_reason: str | None
+    requestId: str | None = None
+    durationMs: int | None = None
+    openaiResponseId: str | None = None
+    openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
+    openaiDurationMs: int | None = None
+
+
+class CustomerFeatureRecord(StrictBaseModel):
+    customer_id: str | None = None
+    avg_monthly_inflow_6m: float = Field(ge=0)
+    salary_inflow_ratio: float = Field(ge=0, le=1)
+    inflow_cv_6m: float = Field(ge=0)
+    avg_balance_6m: float = Field(ge=0)
+    min_balance_6m: float = Field(ge=0)
+    avg_monthly_spend_6m: float = Field(ge=0)
+    monthly_txn_count_6m: float = Field(ge=0)
+    digital_txn_ratio: float = Field(ge=0, le=1)
+    cash_withdrawal_ratio: float = Field(ge=0, le=1)
+    discretionary_spend_ratio: float = Field(ge=0, le=1)
+    travel_spend_ratio: float = Field(ge=0, le=1)
+    investment_contribution_ratio: float = Field(ge=0, le=1)
+    credit_card_utilisation: float = Field(ge=0, le=1)
+    days_since_last_txn: float = Field(ge=0)
+    monthly_app_logins_3m: float = Field(ge=0)
+    products_held: float = Field(ge=0)
+    overdraft_events_6m: float = Field(ge=0)
+
+
+class SyntheticFeatureProfilesResponse(StrictBaseModel):
+    profiles: list[CustomerFeatureRecord]
+    used_openai: bool
+    fallback_reason: str | None
+
+
+class AudienceFitRequest(StrictBaseModel):
+    campaignName: str
+    advertisementCopy: str
+    channel: str
+    placement: str
+    campaignContext: str
+    audienceHypothesis: str
+    audienceCues: list[str]
+    behaviorSignals: list[str]
+    profileCount: int = Field(ge=1, le=100)
+
+
+class SegmentFitSummary(StrictBaseModel):
+    segment_id: int
+    segment_name: str
+    count: int
+    percentage: float
+    average_confidence: float
+
+
+class AudienceFitResponse(StrictBaseModel):
+    segments: list[SegmentFitSummary]
+    profileCount: int
+    primarySegment: str | None
+    segmentationServiceUrl: str
+    used_openai: bool
+    fallback_reason: str | None
+    requestId: str | None = None
+    durationMs: int | None = None
+    openaiResponseId: str | None = None
+    openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
+    openaiDurationMs: int | None = None
+
+
 class TriggeredRule(StrictBaseModel):
     ruleId: str
     description: str
@@ -83,6 +172,10 @@ class DevelopmentDebug(StrictBaseModel):
     hasRawOpenAIResult: bool
     openaiResponseId: str | None = None
     openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
+    durationMs: int | None = None
+    openaiDurationMs: int | None = None
+    postProcessingDurationMs: int | None = None
     postProcessingWarning: str | None = None
     rawOpenAIResult: dict[str, Any] | None = None
 
@@ -135,8 +228,13 @@ class SimulationResultResponse(StrictBaseModel):
     adjustedScores: dict[str, int] | None = None
     scoreDiffs: dict[str, int] | None = None
     rawOpenAIResult: dict[str, Any] | None = None
+    requestId: str | None = None
+    durationMs: int | None = None
+    openaiDurationMs: int | None = None
+    postProcessingDurationMs: int | None = None
     openaiResponseId: str | None = None
     openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
     postProcessingWarning: str | None = None
     developmentDebug: DevelopmentDebug | None = None
     used_openai: bool

@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -10,14 +12,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 from app.models import (
+    AdAnalysisRequest,
+    AdAnalysisResponse,
+    AudienceFitRequest,
+    AudienceFitResponse,
+    CustomerFeatureRecord,
     GeneratePersonasRequest,
     GeneratePersonasResponse,
     GeneratedPersona,
     LegacyPersona,
+    SegmentFitSummary,
     DevelopmentDebug,
     SimulationResultResponse,
 )
-from app.openai_client import generate_personas_with_openai, simulate_with_openai
+from app.openai_client import (
+    analyze_ad_with_openai,
+    generate_synthetic_feature_profiles_with_openai,
+    generate_personas_with_openai,
+    simulate_with_openai,
+)
 from app.persona_generation import build_mock_personas
 from app.personas import PERSONAS
 from app.scoring import build_mock_simulation
@@ -42,6 +55,190 @@ app.add_middleware(
 @app.get("/api/personas", response_model=list[LegacyPersona])
 def get_personas() -> list[LegacyPersona]:
     return PERSONAS
+
+
+@app.post("/api/analyze-ad", response_model=AdAnalysisResponse)
+def analyze_ad(request: AdAnalysisRequest) -> AdAnalysisResponse:
+    request_id = uuid4().hex
+    endpoint_started_at = time.perf_counter()
+    logger.info(
+        "analyze_ad_request_received requestId=%s timestamp=%s campaignName=%r",
+        request_id,
+        _utc_timestamp(),
+        request.campaignName,
+    )
+
+    openai_started_at: float | None = None
+    try:
+        openai_started_at = time.perf_counter()
+        logger.info(
+            "analyze_ad_openai_start requestId=%s timestamp=%s",
+            request_id,
+            _utc_timestamp(),
+        )
+        result = analyze_ad_with_openai(
+            campaign_name=request.campaignName,
+            advertisement_copy=request.advertisementCopy,
+            channel=request.channel,
+            placement=request.placement,
+            campaign_context=request.campaignContext,
+            request_id=request_id,
+        )
+        duration_ms = _duration_ms(endpoint_started_at)
+        openai_duration_ms = result.openaiDurationMs or _duration_ms(openai_started_at)
+        logger.info(
+            "analyze_ad_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "openaiDurationMs=%s success=True used_openai=%s",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            openai_duration_ms,
+            result.used_openai,
+        )
+        return result.model_copy(
+            update={
+                "requestId": request_id,
+                "durationMs": duration_ms,
+                "openaiDurationMs": openai_duration_ms,
+            }
+        )
+    except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
+        error = normalize_fallback_reason(exc)
+        openai_attempts = getattr(exc, "attempts", None)
+        openai_response_ids = getattr(exc, "openai_response_ids", None)
+        openai_duration_ms = getattr(exc, "openai_duration_ms", None)
+        openai_response_id = getattr(exc, "openai_response_id", None)
+        if openai_started_at is not None:
+            logger.info(
+                "analyze_ad_openai_end requestId=%s timestamp=%s openaiDurationMs=%s "
+                "success=False openaiAttempts=%s openaiResponseId=%r "
+                "openaiAttemptResponseIds=%s error=%r",
+                request_id,
+                _utc_timestamp(),
+                openai_duration_ms or _duration_ms(openai_started_at),
+                openai_attempts,
+                openai_response_id,
+                openai_response_ids,
+                error,
+            )
+        logger.exception(
+            "analyze_ad_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=False error=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            error,
+        )
+        raise HTTPException(
+            status_code=_openai_error_status(error),
+            detail={
+                "requestId": request_id,
+                "error": error,
+                "durationMs": duration_ms,
+                "openaiAttempts": openai_attempts,
+                "openaiResponseId": openai_response_id,
+                "openaiAttemptResponseIds": openai_response_ids,
+                "openaiDurationMs": openai_duration_ms,
+            },
+        ) from exc
+
+
+@app.post("/api/audience-fit", response_model=AudienceFitResponse)
+def audience_fit(request: AudienceFitRequest) -> AudienceFitResponse:
+    request_id = uuid4().hex
+    endpoint_started_at = time.perf_counter()
+    segmentation_url = _segmentation_service_url()
+    logger.info(
+        "audience_fit_request_received requestId=%s timestamp=%s campaignName=%r "
+        "profileCount=%s segmentationUrl=%s",
+        request_id,
+        _utc_timestamp(),
+        request.campaignName,
+        request.profileCount,
+        segmentation_url,
+    )
+
+    openai_started_at: float | None = None
+    try:
+        openai_started_at = time.perf_counter()
+        profiles_result, openai_result = generate_synthetic_feature_profiles_with_openai(
+            campaign_name=request.campaignName,
+            advertisement_copy=request.advertisementCopy,
+            channel=request.channel,
+            placement=request.placement,
+            campaign_context=request.campaignContext,
+            audience_hypothesis=request.audienceHypothesis,
+            audience_cues=request.audienceCues,
+            behavior_signals=request.behaviorSignals,
+            profile_count=request.profileCount,
+            request_id=request_id,
+        )
+        profiles = [_normalize_feature_record(profile) for profile in profiles_result.profiles]
+        segment_results = _segment_profiles(segmentation_url, profiles)
+        segments = _aggregate_segment_results(segment_results)
+        duration_ms = _duration_ms(endpoint_started_at)
+        primary_segment = segments[0].segment_name if segments else None
+        logger.info(
+            "audience_fit_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "profileCount=%s primarySegment=%r success=True",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            len(profiles),
+            primary_segment,
+        )
+        return AudienceFitResponse(
+            segments=segments,
+            profileCount=len(profiles),
+            primarySegment=primary_segment,
+            segmentationServiceUrl=segmentation_url,
+            used_openai=True,
+            fallback_reason=None,
+            requestId=request_id,
+            durationMs=duration_ms,
+            openaiResponseId=getattr(openai_result.response, "id", None),
+            openaiAttempts=openai_result.attempts,
+            openaiAttemptResponseIds=openai_result.response_ids,
+            openaiDurationMs=openai_result.duration_ms,
+        )
+    except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
+        error = normalize_fallback_reason(exc)
+        openai_attempts = getattr(exc, "attempts", None)
+        openai_response_ids = getattr(exc, "openai_response_ids", None)
+        openai_duration_ms = getattr(exc, "openai_duration_ms", None)
+        openai_response_id = getattr(exc, "openai_response_id", None)
+        if openai_started_at is not None:
+            logger.info(
+                "audience_fit_openai_or_segmentation_end requestId=%s timestamp=%s "
+                "durationMs=%s success=False openaiAttempts=%s error=%r",
+                request_id,
+                _utc_timestamp(),
+                openai_duration_ms or _duration_ms(openai_started_at),
+                openai_attempts,
+                error,
+            )
+        logger.exception(
+            "audience_fit_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=False error=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            error,
+        )
+        raise HTTPException(
+            status_code=_openai_error_status(error),
+            detail={
+                "requestId": request_id,
+                "error": error,
+                "durationMs": duration_ms,
+                "openaiAttempts": openai_attempts,
+                "openaiResponseId": openai_response_id,
+                "openaiAttemptResponseIds": openai_response_ids,
+                "openaiDurationMs": openai_duration_ms,
+            },
+        ) from exc
 
 
 @app.post("/api/generate-personas", response_model=GeneratePersonasResponse)
@@ -138,6 +335,8 @@ async def run_simulation(
     screenshot: UploadFile | None = File(default=None),
 ) -> SimulationResultResponse:
     request_id = uuid4().hex
+    endpoint_started_at = time.perf_counter()
+    request_received_at = _utc_timestamp()
     generated_personas = _parse_personas(personas, request_id)
     image_bytes = None
     image_content_type = None
@@ -147,6 +346,16 @@ async def run_simulation(
     image_uploaded = image_bytes is not None
     persona_names = [persona.name for persona in generated_personas]
 
+    logger.info(
+        "simulation_request_received requestId=%s timestamp=%s "
+        "featureName=%r personaCount=%s personaNames=%s imageUploaded=%s",
+        request_id,
+        request_received_at,
+        featureName,
+        len(persona_names),
+        persona_names,
+        image_uploaded,
+    )
     _log_simulation_event(
         request_id=request_id,
         feature_name=featureName,
@@ -158,7 +367,14 @@ async def run_simulation(
         fallback_reason=None,
     )
 
+    openai_started_at: float | None = None
     try:
+        openai_started_at = time.perf_counter()
+        logger.info(
+            "simulation_openai_start requestId=%s timestamp=%s",
+            request_id,
+            _utc_timestamp(),
+        )
         result = simulate_with_openai(
             personas=generated_personas,
             feature_name=featureName,
@@ -169,6 +385,27 @@ async def run_simulation(
             image_bytes=image_bytes,
             image_content_type=image_content_type,
             request_id=request_id,
+        )
+        duration_ms = _duration_ms(endpoint_started_at)
+        openai_duration_ms = result.openaiDurationMs or _duration_ms(openai_started_at)
+        logger.info(
+            "simulation_openai_end requestId=%s timestamp=%s openaiDurationMs=%s "
+            "success=True openaiAttempts=%s openaiResponseId=%r "
+            "openaiAttemptResponseIds=%s postProcessingDurationMs=%s",
+            request_id,
+            _utc_timestamp(),
+            openai_duration_ms,
+            result.openaiAttempts,
+            result.openaiResponseId,
+            result.openaiAttemptResponseIds,
+            result.postProcessingDurationMs,
+        )
+        result = result.model_copy(
+            update={
+                "requestId": request_id,
+                "durationMs": duration_ms,
+                "openaiDurationMs": openai_duration_ms,
+            }
         )
         _log_simulation_event(
             request_id=request_id,
@@ -183,6 +420,15 @@ async def run_simulation(
             openai_response_id=result.openaiResponseId,
             post_processing_warning=result.postProcessingWarning,
         )
+        logger.info(
+            "simulation_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=True used_openai=%s fallback_reason=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            result.used_openai,
+            result.fallback_reason,
+        )
         return _with_development_debug(
             result=result,
             request_id=request_id,
@@ -190,19 +436,25 @@ async def run_simulation(
             persona_names=persona_names,
         )
     except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
         fallback_reason = normalize_fallback_reason(exc)
         openai_attempts = getattr(exc, "attempts", None)
-        result = build_mock_simulation(
-            personas=generated_personas,
-            feature_name=featureName,
-            message=bankingMessage,
-            target_customers=targetCustomers,
-            channel=channel,
-            send_timing=sendTiming,
-            image_uploaded=image_uploaded,
-            fallback_reason=fallback_reason,
-        )
-        result = result.model_copy(update={"openaiAttempts": openai_attempts})
+        openai_response_ids = getattr(exc, "openai_response_ids", None)
+        openai_duration_ms = getattr(exc, "openai_duration_ms", None)
+        openai_response_id = getattr(exc, "openai_response_id", None)
+        if openai_started_at is not None:
+            logger.info(
+                "simulation_openai_end requestId=%s timestamp=%s openaiDurationMs=%s "
+                "success=False openaiAttempts=%s openaiResponseId=%r "
+                "openaiAttemptResponseIds=%s error=%r",
+                request_id,
+                _utc_timestamp(),
+                openai_duration_ms or _duration_ms(openai_started_at),
+                openai_attempts,
+                openai_response_id,
+                openai_response_ids,
+                fallback_reason,
+            )
         _log_simulation_event(
             request_id=request_id,
             feature_name=featureName,
@@ -210,18 +462,36 @@ async def run_simulation(
             image_uploaded=image_uploaded,
             openai_called=True,
             openai_succeeded=False,
-            used_openai=result.used_openai,
+            used_openai=False,
             fallback_reason=fallback_reason,
-            openai_attempts=result.openaiAttempts,
-            openai_response_id=result.openaiResponseId,
-            post_processing_warning=result.postProcessingWarning,
+            openai_attempts=openai_attempts,
+            openai_response_id=openai_response_id,
+            post_processing_warning=None,
         )
-        return _with_development_debug(
-            result=result,
-            request_id=request_id,
-            image_uploaded=image_uploaded,
-            persona_names=persona_names,
+        logger.exception(
+            "simulation_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=False error=%r openaiAttempts=%s openaiResponseId=%r "
+            "openaiAttemptResponseIds=%s",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            fallback_reason,
+            openai_attempts,
+            openai_response_id,
+            openai_response_ids,
         )
+        raise HTTPException(
+            status_code=_openai_error_status(fallback_reason),
+            detail={
+                "requestId": request_id,
+                "error": fallback_reason,
+                "durationMs": duration_ms,
+                "openaiAttempts": openai_attempts,
+                "openaiResponseId": openai_response_id,
+                "openaiAttemptResponseIds": openai_response_ids,
+                "openaiDurationMs": openai_duration_ms,
+            },
+        ) from exc
 
 
 @app.post("/api/simulate", response_model=SimulationResultResponse)
@@ -326,7 +596,10 @@ def _parse_personas(personas_json: str, request_id: str) -> list[GeneratedPerson
             request_id,
             exc,
         )
-        raise HTTPException(status_code=400, detail="Invalid personas payload") from exc
+        raise HTTPException(
+            status_code=400,
+            detail={"requestId": request_id, "error": "Invalid personas payload"},
+        ) from exc
 
 
 def _with_development_debug(
@@ -346,6 +619,10 @@ def _with_development_debug(
         hasRawOpenAIResult=result.rawOpenAIResult is not None,
         openaiResponseId=result.openaiResponseId,
         openaiAttempts=result.openaiAttempts,
+        openaiAttemptResponseIds=result.openaiAttemptResponseIds,
+        durationMs=result.durationMs,
+        openaiDurationMs=result.openaiDurationMs,
+        postProcessingDurationMs=result.postProcessingDurationMs,
         postProcessingWarning=result.postProcessingWarning,
         rawOpenAIResult=raw_openai_result,
     )
@@ -354,6 +631,92 @@ def _with_development_debug(
 
 def is_development_mode() -> bool:
     return os.getenv("APP_ENV", "development").lower() != "production"
+
+
+def _segmentation_service_url() -> str:
+    return os.getenv("SEGMENTATION_SERVICE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _normalize_feature_record(record: CustomerFeatureRecord) -> CustomerFeatureRecord:
+    data = record.model_dump()
+    for key in [
+        "salary_inflow_ratio",
+        "digital_txn_ratio",
+        "cash_withdrawal_ratio",
+        "discretionary_spend_ratio",
+        "travel_spend_ratio",
+        "investment_contribution_ratio",
+        "credit_card_utilisation",
+    ]:
+        data[key] = min(1.0, max(0.0, float(data[key])))
+    for key in [
+        "avg_monthly_inflow_6m",
+        "inflow_cv_6m",
+        "avg_balance_6m",
+        "min_balance_6m",
+        "avg_monthly_spend_6m",
+        "monthly_txn_count_6m",
+        "days_since_last_txn",
+        "monthly_app_logins_3m",
+        "products_held",
+        "overdraft_events_6m",
+    ]:
+        data[key] = max(0.0, float(data[key]))
+    data["min_balance_6m"] = min(data["min_balance_6m"], data["avg_balance_6m"])
+    return CustomerFeatureRecord.model_validate(data)
+
+
+def _segment_profiles(
+    segmentation_url: str,
+    profiles: list[CustomerFeatureRecord],
+) -> list[dict]:
+    payload = json.dumps(
+        {"customers": [profile.model_dump() for profile in profiles]}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{segmentation_url}/v1/segment",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"segmentation_service_error: {exc}") from exc
+    results = raw.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("segmentation_service_error: missing results")
+    return results
+
+
+def _aggregate_segment_results(results: list[dict]) -> list[SegmentFitSummary]:
+    total = len(results)
+    grouped: dict[str, dict] = {}
+    for result in results:
+        name = str(result["segment_name"])
+        group = grouped.setdefault(
+            name,
+            {
+                "segment_id": int(result["segment_id"]),
+                "segment_name": name,
+                "count": 0,
+                "confidence_sum": 0.0,
+            },
+        )
+        group["count"] += 1
+        group["confidence_sum"] += float(result.get("assignment_confidence", 0))
+    summaries = [
+        SegmentFitSummary(
+            segment_id=group["segment_id"],
+            segment_name=group["segment_name"],
+            count=group["count"],
+            percentage=round((group["count"] / total) * 100, 1) if total else 0,
+            average_confidence=round(group["confidence_sum"] / group["count"], 4),
+        )
+        for group in grouped.values()
+    ]
+    return sorted(summaries, key=lambda item: item.percentage, reverse=True)
 
 
 def _utc_timestamp() -> str:

@@ -31,6 +31,68 @@ export interface GeneratePersonasResponse {
   durationMs?: number | null;
 }
 
+export interface AdAnalysisRequest {
+  campaignName: string;
+  advertisementCopy: string;
+  channel: string;
+  placement: string;
+  campaignContext: string;
+}
+
+export interface AdAnalysisResponse {
+  productType: string;
+  offerAngle: string;
+  likelyIntent: string;
+  audienceCues: string[];
+  behaviorSignals: string[];
+  ambiguity: string[];
+  audienceHypothesis: string;
+  expectedCustomerAction: string;
+  used_openai: boolean;
+  fallback_reason: string | null;
+  requestId?: string | null;
+  durationMs?: number | null;
+  openaiResponseId?: string | null;
+  openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
+  openaiDurationMs?: number | null;
+}
+
+export interface AudienceFitRequest {
+  campaignName: string;
+  advertisementCopy: string;
+  channel: string;
+  placement: string;
+  campaignContext: string;
+  audienceHypothesis: string;
+  audienceCues: string[];
+  behaviorSignals: string[];
+  profileCount: number;
+}
+
+export interface SegmentFitSummary {
+  segment_id: number;
+  segment_name: string;
+  count: number;
+  percentage: number;
+  average_confidence: number;
+}
+
+export interface AudienceFitResponse {
+  segments: SegmentFitSummary[];
+  profileCount: number;
+  primarySegment: string | null;
+  segmentationServiceUrl: string;
+  used_openai: boolean;
+  fallback_reason: string | null;
+  requestId?: string | null;
+  durationMs?: number | null;
+  openaiResponseId?: string | null;
+  openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
+  openaiDurationMs?: number | null;
+}
+
 export interface TriggeredRule {
   ruleId: string;
   description: string;
@@ -80,6 +142,10 @@ export interface DevelopmentDebug {
   hasRawOpenAIResult: boolean;
   openaiResponseId?: string | null;
   openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
+  durationMs?: number | null;
+  openaiDurationMs?: number | null;
+  postProcessingDurationMs?: number | null;
   postProcessingWarning?: string | null;
   rawOpenAIResult?: unknown;
 }
@@ -107,8 +173,13 @@ export interface SimulationResponse {
   adjustedScores?: Record<string, number> | null;
   scoreDiffs?: Record<string, number> | null;
   rawOpenAIResult?: unknown;
+  requestId?: string | null;
+  durationMs?: number | null;
+  openaiDurationMs?: number | null;
+  postProcessingDurationMs?: number | null;
   openaiResponseId?: string | null;
   openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
   postProcessingWarning?: string | null;
   developmentDebug?: DevelopmentDebug | null;
   used_openai: boolean;

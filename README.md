@@ -43,10 +43,10 @@ cd synthetic-customer-lab/backend
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 8001
 ```
 
-The backend runs at `http://127.0.0.1:8000`.
+The Synthetic Customer Lab backend runs at `http://127.0.0.1:8001`. Keep `http://127.0.0.1:8000` available for the separate bank segmentation service.
 
 ## Run Frontend
 
@@ -56,7 +56,7 @@ npm install
 npm run dev
 ```
 
-The frontend runs at `http://localhost:5173` and proxies `/api` calls to the FastAPI backend.
+The frontend runs at `http://localhost:5173` and proxies `/api` calls to the FastAPI backend on port `8001`.
 
 ## OpenAI Setup
 
@@ -65,6 +65,7 @@ Copy `.env.example` to `.env` or set environment variables before starting the b
 ```bash
 OPENAI_API_KEY=your_key_here
 OPENAI_MODEL=gpt-5.5
+SEGMENTATION_SERVICE_URL=http://127.0.0.1:8000
 ```
 
 The OpenAI API is called only from the backend. The frontend never receives or stores `OPENAI_API_KEY`.

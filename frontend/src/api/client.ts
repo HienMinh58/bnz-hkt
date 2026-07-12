@@ -1,4 +1,8 @@
 import type {
+  AdAnalysisRequest,
+  AdAnalysisResponse,
+  AudienceFitRequest,
+  AudienceFitResponse,
   FeatureTestInput,
   GeneratePersonasResponse,
   GeneratedPersona,
@@ -6,7 +10,10 @@ import type {
   SimulationResponse,
 } from "../types/simulation";
 
-const GENERATE_PERSONAS_TIMEOUT_MS = 90_000;
+const ANALYZE_AD_TIMEOUT_MS = 120_000;
+const AUDIENCE_FIT_TIMEOUT_MS = 240_000;
+const GENERATE_PERSONAS_TIMEOUT_MS = 330_000;
+const RUN_SIMULATION_TIMEOUT_MS = 330_000;
 
 function toLegacySimulationForm(form: FeatureTestInput | SimulationForm): SimulationForm {
   if ("customerFacingCopy" in form) {
@@ -31,6 +38,143 @@ function toLegacySimulationForm(form: FeatureTestInput | SimulationForm): Simula
     };
   }
   return form;
+}
+
+export async function analyzeAd(
+  request: AdAnalysisRequest,
+): Promise<AdAnalysisResponse> {
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    ANALYZE_AD_TIMEOUT_MS,
+  );
+  console.info("/api/analyze-ad request started", {
+    campaignName: request.campaignName,
+    startedAt: new Date().toISOString(),
+    timeoutMs: ANALYZE_AD_TIMEOUT_MS,
+  });
+
+  try {
+    const response = await fetch("/api/analyze-ad", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(request),
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const requestId = detail?.requestId ?? payload?.requestId ?? null;
+      const error = detail?.error ?? payload?.error ?? "Ad analysis failed";
+      console.error("/api/analyze-ad request failed", {
+        requestId,
+        status: response.status,
+        error,
+        durationMs,
+        receivedAt: new Date().toISOString(),
+      });
+      throw new Error(
+        requestId
+          ? `Ad analysis failed (${requestId}): ${error}`
+          : `Ad analysis failed: ${error}`,
+      );
+    }
+
+    const data = payload as AdAnalysisResponse;
+    console.info("/api/analyze-ad response received", {
+      requestId: data.requestId,
+      durationMs,
+      backendDurationMs: data.durationMs,
+      openaiDurationMs: data.openaiDurationMs,
+      receivedAt: new Date().toISOString(),
+    });
+    return data;
+  } catch (error) {
+    const durationMs = Math.round(performance.now() - startedAt);
+    if (error instanceof DOMException && error.name === "AbortError") {
+      console.error("/api/analyze-ad request timed out", {
+        durationMs,
+        timeoutMs: ANALYZE_AD_TIMEOUT_MS,
+        receivedAt: new Date().toISOString(),
+      });
+      throw new Error(
+        `Ad analysis timed out after ${Math.round(
+          ANALYZE_AD_TIMEOUT_MS / 1000,
+        )} seconds. Try again with a shorter brief or retry later.`,
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+export async function generateAudienceFit(
+  request: AudienceFitRequest,
+): Promise<AudienceFitResponse> {
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    AUDIENCE_FIT_TIMEOUT_MS,
+  );
+  console.info("/api/audience-fit request started", {
+    campaignName: request.campaignName,
+    profileCount: request.profileCount,
+    startedAt: new Date().toISOString(),
+    timeoutMs: AUDIENCE_FIT_TIMEOUT_MS,
+  });
+
+  try {
+    const response = await fetch("/api/audience-fit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(request),
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const requestId = detail?.requestId ?? payload?.requestId ?? null;
+      const error = detail?.error ?? payload?.error ?? "Audience fit failed";
+      throw new Error(
+        requestId
+          ? `Audience fit failed (${requestId}): ${error}`
+          : `Audience fit failed: ${error}`,
+      );
+    }
+
+    const data = payload as AudienceFitResponse;
+    console.info("/api/audience-fit response received", {
+      requestId: data.requestId,
+      durationMs,
+      backendDurationMs: data.durationMs,
+      profileCount: data.profileCount,
+      primarySegment: data.primarySegment,
+      receivedAt: new Date().toISOString(),
+    });
+    return data;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(
+        `Audience fit timed out after ${Math.round(
+          AUDIENCE_FIT_TIMEOUT_MS / 1000,
+        )} seconds. Try fewer profiles or retry later.`,
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 export async function generatePersonas(
@@ -123,6 +267,12 @@ export async function runSimulation(
   personas: GeneratedPersona[],
 ): Promise<SimulationResponse> {
   const legacyForm = toLegacySimulationForm(form);
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    RUN_SIMULATION_TIMEOUT_MS,
+  );
   const body = new FormData();
   body.append("featureName", legacyForm.featureName);
   body.append("bankingMessage", legacyForm.bankingMessage);
@@ -134,12 +284,82 @@ export async function runSimulation(
     body.append("screenshot", legacyForm.screenshot);
   }
 
-  const response = await fetch("/api/run-simulation", {
-    method: "POST",
-    body,
+  console.info("/api/run-simulation request started", {
+    featureName: legacyForm.featureName,
+    personaCount: personas.length,
+    imageUploaded: Boolean(legacyForm.screenshot),
+    startedAt: new Date().toISOString(),
+    timeoutMs: RUN_SIMULATION_TIMEOUT_MS,
   });
-  if (!response.ok) {
-    throw new Error("Simulation failed");
+
+  try {
+    const response = await fetch("/api/run-simulation", {
+      method: "POST",
+      body,
+      signal: controller.signal,
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const requestId = detail?.requestId ?? payload?.requestId ?? null;
+      const error = detail?.error ?? payload?.error ?? "Simulation failed";
+      const backendDurationMs = detail?.durationMs ?? payload?.durationMs ?? null;
+      console.error("/api/run-simulation request failed", {
+        requestId,
+        status: response.status,
+        error,
+        durationMs,
+        backendDurationMs,
+        openaiAttempts: detail?.openaiAttempts,
+        openaiResponseId: detail?.openaiResponseId,
+        openaiAttemptResponseIds: detail?.openaiAttemptResponseIds,
+        openaiDurationMs: detail?.openaiDurationMs,
+        receivedAt: new Date().toISOString(),
+      });
+      throw new Error(
+        requestId
+          ? `Simulation failed (${requestId}): ${error}`
+          : `Simulation failed: ${error}`,
+      );
+    }
+
+    const data = payload as SimulationResponse;
+    console.info("/api/run-simulation response received", {
+      requestId: data.requestId ?? data.developmentDebug?.requestId,
+      durationMs,
+      backendDurationMs: data.durationMs ?? data.developmentDebug?.durationMs,
+      openaiDurationMs:
+        data.openaiDurationMs ?? data.developmentDebug?.openaiDurationMs,
+      postProcessingDurationMs:
+        data.postProcessingDurationMs ??
+        data.developmentDebug?.postProcessingDurationMs,
+      openaiAttempts: data.openaiAttempts ?? data.developmentDebug?.openaiAttempts,
+      openaiResponseId:
+        data.openaiResponseId ?? data.developmentDebug?.openaiResponseId,
+      openaiAttemptResponseIds:
+        data.openaiAttemptResponseIds ??
+        data.developmentDebug?.openaiAttemptResponseIds,
+      receivedAt: new Date().toISOString(),
+    });
+    return data;
+  } catch (error) {
+    const durationMs = Math.round(performance.now() - startedAt);
+    if (error instanceof DOMException && error.name === "AbortError") {
+      console.error("/api/run-simulation request timed out", {
+        durationMs,
+        timeoutMs: RUN_SIMULATION_TIMEOUT_MS,
+        receivedAt: new Date().toISOString(),
+      });
+      throw new Error(
+        `Simulation timed out after ${Math.round(
+          RUN_SIMULATION_TIMEOUT_MS / 1000,
+        )} seconds. Try again with fewer personas, without an image, or retry later.`,
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-  return response.json();
 }

@@ -17,7 +17,6 @@ import {
   Network,
   ShieldCheck,
   Sparkles,
-  Upload,
   UserRound,
   X,
 } from "lucide-react";
@@ -26,9 +25,15 @@ import ForceGraph2D, {
   type LinkObject,
   type NodeObject,
 } from "react-force-graph-2d";
-import { forceCollide } from "d3-force";
-import { generatePersonas, runSimulation } from "../api/client";
+import {
+  analyzeAd,
+  generateAudienceFit,
+  generatePersonas,
+  runSimulation,
+} from "../api/client";
 import type {
+  AdAnalysisResponse,
+  AudienceFitResponse,
   FeatureTestInput,
   GeneratedPersona,
   Persona,
@@ -518,6 +523,132 @@ type GraphLayout = {
   minWidth: number;
 };
 
+type AdAnalysisPreview = {
+  productType: string;
+  offerAngle: string;
+  likelyIntent: string;
+  audienceCues: string[];
+  behaviorSignals: string[];
+  ambiguity: string[];
+  hypothesis: string;
+  expectedAction: string;
+  usedOpenAI?: boolean;
+  fallbackReason?: string | null;
+};
+
+function includesAny(value: string, terms: string[]) {
+  return terms.some((term) => value.includes(term));
+}
+
+function buildAdAnalysisPreview(form: FeatureTestInput): AdAnalysisPreview {
+  const text = [
+    form.featureName,
+    form.featureDescription,
+    form.customerFacingCopy,
+    form.channel,
+    form.shownTiming,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const productType = includesAny(text, ["credit card", "card", "cashback", "points", "rewards"])
+    ? "Credit card / rewards offer"
+    : includesAny(text, ["home loan", "mortgage", "refinance"])
+      ? "Home lending campaign"
+      : includesAny(text, ["save", "savings", "term deposit", "interest rate"])
+        ? "Savings or deposit campaign"
+        : includesAny(text, ["invest", "portfolio", "wealth", "kiwisaver"])
+          ? "Investment / wealth campaign"
+          : includesAny(text, ["loan", "overdraft", "repay", "debt"])
+            ? "Credit or cashflow support"
+            : "General banking campaign";
+
+  const offerAngle = includesAny(text, ["travel", "flight", "hotel", "dining", "restaurant"])
+    ? "Lifestyle and rewards"
+    : includesAny(text, ["cashback", "discount", "deal", "save", "no fee"])
+      ? "Value and cost saving"
+      : includesAny(text, ["security", "fraud", "protect", "safe"])
+        ? "Trust and protection"
+        : includesAny(text, ["fast", "instant", "easy", "app", "digital"])
+          ? "Convenience and digital ease"
+          : "Product benefit awareness";
+
+  const likelyIntent = includesAny(text, ["apply", "join", "switch", "open", "sign up"])
+    ? "Conversion"
+    : includesAny(text, ["upgrade", "increase", "premium", "platinum"])
+      ? "Upsell"
+      : includesAny(text, ["remind", "renew", "keep", "continue"])
+        ? "Retention"
+        : "Consideration";
+
+  const audienceCues = [
+    includesAny(text, ["app", "online", "digital", "mobile"]) ? "Digital-first customers" : null,
+    includesAny(text, ["travel", "dining", "shopping", "lifestyle"]) ? "Lifestyle-led spenders" : null,
+    includesAny(text, ["premium", "platinum", "wealth", "invest"]) ? "Higher-value customers" : null,
+    includesAny(text, ["save", "budget", "no fee", "cashback"]) ? "Value-conscious customers" : null,
+    includesAny(text, ["home", "mortgage", "family"]) ? "Household decision makers" : null,
+  ].filter(Boolean) as string[];
+
+  const behaviorSignals = [
+    includesAny(text, ["credit card", "card", "points", "rewards"]) ? "Credit-active behavior" : null,
+    includesAny(text, ["travel", "dining", "shopping"]) ? "Discretionary spending" : null,
+    includesAny(text, ["save", "savings", "deposit"]) ? "Savings-oriented behavior" : null,
+    includesAny(text, ["invest", "wealth", "portfolio"]) ? "Investment interest" : null,
+    includesAny(text, ["overdraft", "loan", "repay"]) ? "Cashflow or borrowing need" : null,
+  ].filter(Boolean) as string[];
+
+  const ambiguity = [
+    !includesAny(text, ["low income", "high income", "premium", "student", "business", "family"])
+      ? "Income level is not explicit."
+      : null,
+    !includesAny(text, ["app", "email", "sms", "branch", "web", "mobile"])
+      ? "Preferred channel is weakly stated."
+      : null,
+    !includesAny(text, ["urgent", "limited time", "today", "deadline"])
+      ? "Timing pressure is not clear."
+      : null,
+  ].filter(Boolean) as string[];
+
+  const hypothesis =
+    audienceCues.length || behaviorSignals.length
+      ? `Likely audience: ${[...audienceCues, ...behaviorSignals]
+          .slice(0, 4)
+          .join(", ")
+          .toLowerCase()}.`
+      : "Likely audience: customers whose banking behavior aligns with the offer, channel, and action requested by this campaign.";
+
+  return {
+    productType,
+    offerAngle,
+    likelyIntent,
+    audienceCues: audienceCues.length ? audienceCues : ["No strong audience cue yet"],
+    behaviorSignals: behaviorSignals.length ? behaviorSignals : ["No strong behavior signal yet"],
+    ambiguity: ambiguity.length ? ambiguity : ["No major ambiguity detected from the current text."],
+    hypothesis,
+    expectedAction:
+      likelyIntent === "Conversion"
+        ? "Review the offer and start an application or sign-up flow."
+        : likelyIntent === "Upsell"
+          ? "Compare the upgraded offer and decide whether to proceed."
+          : "Understand the offer and decide whether it is relevant.",
+  };
+}
+
+function fromAdAnalysisResponse(response: AdAnalysisResponse): AdAnalysisPreview {
+  return {
+    productType: response.productType,
+    offerAngle: response.offerAngle,
+    likelyIntent: response.likelyIntent,
+    audienceCues: response.audienceCues,
+    behaviorSignals: response.behaviorSignals,
+    ambiguity: response.ambiguity,
+    hypothesis: response.audienceHypothesis,
+    expectedAction: response.expectedCustomerAction,
+    usedOpenAI: response.used_openai,
+    fallbackReason: response.fallback_reason,
+  };
+}
+
 function getPersonaGraphLayout(
   personas: GeneratedPersona[],
   targetSegment: string,
@@ -907,7 +1038,7 @@ function buildKnowledgeGraphData(
         weight: 1.5,
       });
     });
-    return { nodes, links };
+    return { nodes: applyKnowledgeFanoutLayout(nodes, links), links };
   }
 
   visiblePersonas.forEach((persona, index) => {
@@ -1037,7 +1168,52 @@ function buildKnowledgeGraphData(
   });
 
   nodes.push(...riskNodes.values(), ...attrNodes.values(), ...recommendationNodes.values());
-  return { nodes, links };
+  return { nodes: applyKnowledgeFanoutLayout(nodes, links), links };
+}
+
+function applyKnowledgeFanoutLayout(
+  nodes: KnowledgeGraphNode[],
+  _links: KnowledgeGraphEdge[],
+): KnowledgeGraphNode[] {
+  const byType = (type: KnowledgeNodeType) =>
+    nodes.filter((node) => node.type === type);
+
+  const place = (node: KnowledgeGraphNode | undefined, x: number, y: number) => {
+    if (!node) return;
+    node.x = x;
+    node.y = y;
+    node.fx = x;
+    node.fy = y;
+  };
+
+  const placeColumn = (
+    columnNodes: KnowledgeGraphNode[],
+    x: number,
+    centerY: number,
+    gap: number,
+  ) => {
+    if (!columnNodes.length) return;
+    const startY = centerY - ((columnNodes.length - 1) * gap) / 2;
+    columnNodes.forEach((node, index) => place(node, x, startY + index * gap));
+  };
+
+  const feature = nodes.find((node) => node.type === "feature");
+  const targetSegment = nodes.find((node) => node.type === "targetSegment");
+  const personas = byType("persona");
+  const clusters = byType("cluster");
+  const risks = byType("risk").sort((a, b) => a.label.localeCompare(b.label));
+  const attributes = byType("attribute").sort((a, b) => a.label.localeCompare(b.label));
+  const recommendations = byType("recommendation");
+
+  place(feature, -640, 0);
+  place(targetSegment, -410, 0);
+  placeColumn(clusters, -120, 0, 128);
+  placeColumn(personas, -120, 0, personas.length <= 12 ? 88 : 64);
+  placeColumn(risks, 210, -220, 78);
+  placeColumn(attributes, 210, 220, 62);
+  placeColumn(recommendations, 560, 0, 108);
+
+  return nodes;
 }
 
 function personaAttributes(persona: GeneratedPersona) {
@@ -1344,28 +1520,11 @@ function PersonaNetwork({
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph) return;
-    graph.d3Force("charge")?.strength(-720);
-    graph.d3Force("link")?.distance((link: KnowledgeGraphEdge) => {
-      if (link.type === "targets") return 230;
-      if (link.type === "generates") return personas.length > 12 ? 190 : 220;
-      if (link.type === "hasRisk") return 150;
-      if (link.type === "hasAttribute") return 170;
-      return 190;
-    });
+    graph.d3Force("charge", null);
+    graph.d3Force("link", null);
     graph.d3Force("collide", null);
-    graph.d3Force("collide", forceCollide<KnowledgeGraphNode>());
-    const collide = graph.d3Force("collide") as
-      | {
-          radius: (value: (node: KnowledgeGraphNode) => number) => unknown;
-          strength: (value: number) => unknown;
-          iterations: (value: number) => unknown;
-        }
-      | undefined;
-    collide?.radius((node) => graphNodeTypeConfig[node.type].radius + 34);
-    collide?.strength(0.95);
-    collide?.iterations(3);
     graph.d3ReheatSimulation();
-  }, [graphData, personas.length]);
+  }, [graphData]);
 
   function fitGraph() {
     graphRef.current?.zoomToFit(500, 70);
@@ -2382,6 +2541,10 @@ function SimulationDebugPanel({ result }: { result: SimulationResponse }) {
     hasRawOpenAIResult: developmentDebug?.hasRawOpenAIResult,
     openaiResponseId: developmentDebug?.openaiResponseId,
     openaiAttempts: developmentDebug?.openaiAttempts,
+    openaiAttemptResponseIds: developmentDebug?.openaiAttemptResponseIds,
+    durationMs: developmentDebug?.durationMs,
+    openaiDurationMs: developmentDebug?.openaiDurationMs,
+    postProcessingDurationMs: developmentDebug?.postProcessingDurationMs,
     postProcessingWarning: developmentDebug?.postProcessingWarning,
     rawOpenAIResult,
     developmentDebug,
@@ -2413,6 +2576,10 @@ export default function App() {
   const [personaSetupMode, setPersonaSetupMode] = useState<PersonaSetupMode>("auto");
   const [activeTab, setActiveTab] = useState<ActiveTab>("input");
   const [inputsChanged, setInputsChanged] = useState(false);
+  const [analyzingAd, setAnalyzingAd] = useState(false);
+  const [generatingAudienceFit, setGeneratingAudienceFit] = useState(false);
+  const [audienceFit, setAudienceFit] = useState<AudienceFitResponse | null>(null);
+  const [serverAdAnalysis, setServerAdAnalysis] = useState<AdAnalysisPreview | null>(null);
   const [generating, setGenerating] = useState(false);
   const [simulating, setSimulating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2422,21 +2589,25 @@ export default function App() {
     () => form.screenshot?.name ?? "Upload screenshot",
     [form.screenshot],
   );
+  const heuristicAdAnalysis = useMemo(() => buildAdAnalysisPreview(form), [form]);
+  const adAnalysis = serverAdAnalysis ?? heuristicAdAnalysis;
 
   function updateForm(update: Partial<FeatureTestInput>) {
     setForm((current) => ({ ...current, ...update }));
+    setServerAdAnalysis(null);
+    setAudienceFit(null);
     if (selectedPersonas.length || personas.length) {
       setInputsChanged(true);
     }
   }
 
   function validateForm() {
-    if (!form.featureName.trim()) return "Feature name is required";
-    if (!form.featureDescription.trim()) {
-      return "What this feature does is required";
-    }
+    if (!form.featureName.trim()) return "Campaign name is required";
     if (!form.customerFacingCopy.trim()) {
-      return "Customer-facing copy or instruction is required";
+      return "Advertisement copy or campaign brief is required";
+    }
+    if (!form.targetCustomerSegment.trim()) {
+      return "Audience hypothesis is required";
     }
     if (!form.expectedCustomerAction.trim()) {
       return "Expected customer action is required";
@@ -2445,6 +2616,107 @@ export default function App() {
       return "Persona count must be between 1 and 100";
     }
     return null;
+  }
+
+  async function onAnalyzeAd() {
+    if (!form.featureName.trim()) {
+      setError("Campaign name is required before ad analysis");
+      return;
+    }
+    if (!form.customerFacingCopy.trim()) {
+      setError("Advertisement copy or campaign brief is required before ad analysis");
+      return;
+    }
+    setAnalyzingAd(true);
+    setError(null);
+    try {
+      const response = await analyzeAd({
+        campaignName: form.featureName,
+        advertisementCopy: form.customerFacingCopy,
+        channel: form.channel,
+        placement: form.shownTiming,
+        campaignContext: form.featureDescription,
+      });
+      const preview = fromAdAnalysisResponse(response);
+      setServerAdAnalysis(preview);
+      setAudienceFit(null);
+      setForm((current) => ({
+        ...current,
+        targetCustomerSegment: preview.hypothesis,
+        expectedCustomerAction: preview.expectedAction,
+        featureDescription: current.featureDescription.trim()
+          ? current.featureDescription
+          : [
+              `Product type: ${preview.productType}.`,
+              `Offer angle: ${preview.offerAngle}.`,
+              `Likely intent: ${preview.likelyIntent}.`,
+              `Behavior signals: ${preview.behaviorSignals.join(", ")}.`,
+            ].join(" "),
+      }));
+    } catch (err) {
+      const preview = buildAdAnalysisPreview(form);
+      setServerAdAnalysis({ ...preview, usedOpenAI: false, fallbackReason: String(err) });
+      setForm((current) => ({
+        ...current,
+        targetCustomerSegment: current.targetCustomerSegment.trim()
+          ? current.targetCustomerSegment
+          : preview.hypothesis,
+        expectedCustomerAction: current.expectedCustomerAction.trim()
+          ? current.expectedCustomerAction
+          : preview.expectedAction,
+        featureDescription: current.featureDescription.trim()
+          ? current.featureDescription
+          : [
+              `Product type: ${preview.productType}.`,
+              `Offer angle: ${preview.offerAngle}.`,
+              `Likely intent: ${preview.likelyIntent}.`,
+              `Behavior signals: ${preview.behaviorSignals.join(", ")}.`,
+            ].join(" "),
+      }));
+      setError(
+        err instanceof Error
+          ? `${err.message}. Showing local fallback analysis.`
+          : "Ad analysis failed. Showing local fallback analysis.",
+      );
+    } finally {
+      setAnalyzingAd(false);
+    }
+  }
+
+  async function onGenerateAudienceFit() {
+    if (!form.featureName.trim()) {
+      setError("Campaign name is required before segment fit generation");
+      return;
+    }
+    if (!form.customerFacingCopy.trim()) {
+      setError("Advertisement copy or campaign brief is required before segment fit generation");
+      return;
+    }
+    const hypothesis = form.targetCustomerSegment.trim() || adAnalysis.hypothesis;
+    if (!hypothesis.trim()) {
+      setError("Audience hypothesis is required before segment fit generation");
+      return;
+    }
+    setGeneratingAudienceFit(true);
+    setError(null);
+    try {
+      const response = await generateAudienceFit({
+        campaignName: form.featureName,
+        advertisementCopy: form.customerFacingCopy,
+        channel: form.channel,
+        placement: form.shownTiming,
+        campaignContext: form.featureDescription,
+        audienceHypothesis: hypothesis,
+        audienceCues: adAnalysis.audienceCues,
+        behaviorSignals: adAnalysis.behaviorSignals,
+        profileCount: form.personaCount,
+      });
+      setAudienceFit(response);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Audience fit failed");
+    } finally {
+      setGeneratingAudienceFit(false);
+    }
   }
 
   function onContinueToPersonaSetup() {
@@ -2601,7 +2873,7 @@ export default function App() {
         ) : null}
 
         {activeTab === "input" ? (
-          <div className="max-w-[420px]">
+          <div className="w-full max-w-5xl">
           <form
             onSubmit={(event: FormEvent<HTMLFormElement>) => {
               event.preventDefault();
@@ -2609,96 +2881,281 @@ export default function App() {
             }}
             className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel"
           >
-            <div className="mb-5 flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-bnz-600" />
-              <h2 className="text-lg font-bold text-slate-950">
-                Step 1: Define feature test
-              </h2>
+            <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-5 w-5 text-bnz-600" />
+                <h2 className="text-lg font-bold text-slate-950">
+                  Step 1: Analyze advertisement
+                </h2>
+              </div>
+              <span className="text-sm font-medium text-slate-500">
+                Ad input to audience hypothesis to persona setup
+              </span>
             </div>
-            <div className="space-y-4">
-              <Field label="Feature name">
+            <div className="grid gap-5 lg:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
+              <section className="space-y-4">
+              <Field label="Campaign name">
                 <input
                   className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-                  placeholder="BNZ OnePass utility onboarding"
+                  placeholder="Platinum travel rewards card"
                   value={form.featureName}
                   onChange={(event) => updateForm({ featureName: event.target.value })}
                 />
               </Field>
-              <Field label="What does this feature do?">
+              <Field label="Advertisement copy or campaign brief">
                 <textarea
-                  className="focus-ring min-h-24 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
-                  placeholder="Helps customers set up a new utility provider and direct debit through the BNZ app."
-                  value={form.featureDescription}
-                  onChange={(event) =>
-                    updateForm({ featureDescription: event.target.value })
-                  }
-                />
-              </Field>
-              <Field label="Customer-facing copy or instruction">
-                <textarea
-                  className="focus-ring min-h-24 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
-                  placeholder="Continue with BNZ OnePass to review your Mercury power setup before anything starts."
+                  className="focus-ring min-h-44 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
+                  placeholder="Earn 3x points on flights, hotels, and dining with a platinum credit card built for frequent travellers."
                   value={form.customerFacingCopy}
                   onChange={(event) =>
                     updateForm({ customerFacingCopy: event.target.value })
                   }
                 />
               </Field>
-              <Field label="Target customer segment">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Channel">
+                  <select
+                    className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
+                    value={form.channel}
+                    onChange={(event) => updateForm({ channel: event.target.value })}
+                  >
+                    {channels.map((channel) => (
+                      <option key={channel}>{channel}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Synthetic profile count">
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
+                    value={form.personaCount}
+                    onChange={(event) =>
+                      updateForm({ personaCount: Number(event.target.value) })
+                    }
+                  />
+                </Field>
+              </div>
+              <Field label="Placement / trigger point">
+                <input
+                  className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
+                  placeholder="Mobile app offer tile, email campaign, search landing page, or post-login banner."
+                  value={form.shownTiming}
+                  onChange={(event) => updateForm({ shownTiming: event.target.value })}
+                />
+              </Field>
+              <Field label="Optional campaign context">
                 <textarea
-                  className="focus-ring min-h-20 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
-                  placeholder="Customers moving into a new home and setting up utilities such as power, internet, or insurance."
+                  className="focus-ring min-h-24 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
+                  placeholder="Add product constraints, eligibility, market, brand tone, or anything not visible in the ad copy."
+                  value={form.featureDescription}
+                  onChange={(event) =>
+                    updateForm({ featureDescription: event.target.value })
+                  }
+                />
+              </Field>
+              <button
+                type="button"
+                disabled={analyzingAd}
+                onClick={() => void onAnalyzeAd()}
+                className="focus-ring inline-flex w-full items-center justify-center gap-2 rounded-lg bg-bnz-700 px-4 py-3 text-sm font-bold text-white shadow-sm transition hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {analyzingAd ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <BrainCircuit className="h-4 w-4" />
+                )}
+                {analyzingAd ? "Analyzing with OpenAI" : "Analyze ad"}
+              </button>
+              </section>
+
+              <aside className="space-y-4">
+                <section className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-950">
+                        Ad analysis
+                      </h3>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Preview of the audience assumptions used in the next step.
+                      </p>
+                    </div>
+                    <div className="flex flex-col items-end gap-2">
+                      <Badge value={adAnalysis.likelyIntent} />
+                      <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-xs font-semibold text-slate-500">
+                        {adAnalysis.usedOpenAI
+                          ? "OpenAI"
+                          : adAnalysis.fallbackReason
+                            ? "Local fallback"
+                            : "Local preview"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid gap-3">
+                    {[
+                      ["Product type", adAnalysis.productType],
+                      ["Offer angle", adAnalysis.offerAngle],
+                      ["Likely intent", adAnalysis.likelyIntent],
+                    ].map(([label, value]) => (
+                      <div
+                        key={label}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-2"
+                      >
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                          {label}
+                        </div>
+                        <div className="mt-1 text-sm font-semibold text-slate-800">
+                          {value}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+                    <div>
+                      <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                        Audience cues
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {adAnalysis.audienceCues.map((cue) => (
+                          <span
+                            key={cue}
+                            className="rounded-full border border-bnz-100 bg-white px-2.5 py-1 text-xs font-semibold text-bnz-700"
+                          >
+                            {cue}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                        Behavior signals
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {adAnalysis.behaviorSignals.map((signal) => (
+                          <span
+                            key={signal}
+                            className="rounded-full border border-emerald-100 bg-white px-2.5 py-1 text-xs font-semibold text-emerald-700"
+                          >
+                            {signal}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="rounded-lg border border-slate-200 bg-white p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-950">
+                        Estimated segment fit
+                      </h3>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Generates synthetic banking feature profiles, then calls the segmentation service.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={generatingAudienceFit || analyzingAd}
+                      onClick={() => void onGenerateAudienceFit()}
+                      className="focus-ring inline-flex items-center justify-center gap-2 rounded-lg border border-bnz-200 bg-bnz-50 px-3 py-2 text-xs font-bold text-bnz-700 transition hover:bg-bnz-100 disabled:cursor-not-allowed disabled:opacity-70"
+                    >
+                      {generatingAudienceFit ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Network className="h-4 w-4" />
+                      )}
+                      {generatingAudienceFit ? "Generating" : "Generate fit"}
+                    </button>
+                  </div>
+
+                  {audienceFit ? (
+                    <div className="mt-4 space-y-3">
+                      <div className="flex items-center justify-between rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">
+                        <span>Primary segment: {audienceFit.primarySegment ?? "None"}</span>
+                        <span>{audienceFit.profileCount} profiles</span>
+                      </div>
+                      {audienceFit.segments.map((segment) => (
+                        <div key={segment.segment_name}>
+                          <div className="mb-1 flex items-center justify-between gap-3 text-xs">
+                            <span className="font-semibold text-slate-700">
+                              {segment.segment_name}
+                            </span>
+                            <span className="font-bold text-slate-900">
+                              {segment.percentage.toFixed(1)}%
+                            </span>
+                          </div>
+                          <div className="h-2 overflow-hidden rounded-full bg-slate-100">
+                            <div
+                              className="h-full rounded-full bg-bnz-700"
+                              style={{ width: `${Math.min(100, segment.percentage)}%` }}
+                            />
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500">
+                            {segment.count} profiles, average confidence{" "}
+                            {segment.average_confidence.toFixed(2)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="mt-4 rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-500">
+                      Generate fit after the ad analysis looks right. Percentages appear after synthetic profiles are classified by the segmentation service.
+                    </div>
+                  )}
+                </section>
+
+                <Field label="Editable audience hypothesis">
+                <textarea
+                  className="focus-ring min-h-28 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
+                  placeholder={adAnalysis.hypothesis}
                   value={form.targetCustomerSegment}
                   onChange={(event) =>
                     updateForm({ targetCustomerSegment: event.target.value })
                   }
                 />
               </Field>
-              <Field label="Where is this shown?">
-                <select
-                  className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-                  value={form.channel}
-                  onChange={(event) => updateForm({ channel: event.target.value })}
-                >
-                  {channels.map((channel) => (
-                    <option key={channel}>{channel}</option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="When is this shown? / Trigger point">
-                <input
-                  className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-                  placeholder="After the customer selects a Mercury power plan and before direct debit confirmation."
-                  value={form.shownTiming}
-                  onChange={(event) => updateForm({ shownTiming: event.target.value })}
-                />
-                <p className="mt-2 text-xs leading-5 text-slate-500">
-                  Describe the moment this appears, for example before payment confirmation, after login, during onboarding, or 2 days before a predicted overdraft.
-                </p>
-              </Field>
               <Field label="Expected customer action">
                 <textarea
                   className="focus-ring min-h-24 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
-                  placeholder="Review the provider, selected bank account, amount, frequency, first payment date, data sharing details, then confirm or cancel."
+                  placeholder={adAnalysis.expectedAction}
                   value={form.expectedCustomerAction}
                   onChange={(event) =>
                     updateForm({ expectedCustomerAction: event.target.value })
                   }
                 />
               </Field>
-              <Field label="Data used / shared">
+              <Field label="Data, eligibility, or privacy notes">
                 <textarea
-                  className="focus-ring min-h-24 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
-                  placeholder="BNZ uses identity details, selected account, address, and payment history. Mercury only receives confirmation status and direct debit setup details after customer consent."
+                  className="focus-ring min-h-20 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm leading-6"
+                  placeholder="Add any stated eligibility criteria, consent language, targeting limits, or product restrictions."
                   value={form.dataUsedShared}
                   onChange={(event) =>
                     updateForm({ dataUsedShared: event.target.value })
                   }
                 />
               </Field>
-              <div>
-                <div className="text-sm font-semibold text-slate-700">Risk focus</div>
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                <section className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                    <div>
+                      <div className="text-sm font-bold text-amber-800">
+                        Ambiguity to resolve
+                      </div>
+                      <ul className="mt-2 space-y-1 text-xs leading-5 text-amber-700">
+                        {adAnalysis.ambiguity.map((item) => (
+                          <li key={item}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                </section>
+              </aside>
+
+              <section className="lg:col-span-2">
+                <div className="text-sm font-semibold text-slate-700">Risk focus for later simulation</div>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                   {riskFocusOptions.map((risk) => {
                     const checked = form.riskFocus.includes(risk);
                     return (
@@ -2726,27 +3183,16 @@ export default function App() {
                     );
                   })}
                 </div>
-              </div>
-              <Field label="Persona count for next step">
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  className="focus-ring w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-                  value={form.personaCount}
-                  onChange={(event) =>
-                    updateForm({ personaCount: Number(event.target.value) })
-                  }
-                />
-              </Field>
-              <Field label="Optional UI screenshot">
+              </section>
+              <section className="lg:col-span-2">
+              <Field label="Optional ad or landing page screenshot">
                 <label className="focus-ring flex cursor-pointer flex-col gap-2 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-sm text-slate-600">
                   <span className="flex min-w-0 items-center gap-2">
-                    <Upload className="h-4 w-4 shrink-0 text-bnz-600" />
+                    <ImageUp className="h-4 w-4 shrink-0 text-bnz-600" />
                     <span className="truncate">{selectedFileName}</span>
                   </span>
                   <span className="text-xs leading-5 text-slate-500">
-                    Upload a customer-facing screen, prototype, notification, or internal dashboard screenshot.
+                    Upload a creative, customer-facing screen, prototype, notification, or landing page screenshot.
                   </span>
                   <input
                     type="file"
@@ -2758,15 +3204,22 @@ export default function App() {
                   />
                 </label>
               </Field>
+              </section>
+              <div className="flex flex-col gap-3 border-t border-slate-200 pt-5 sm:flex-row sm:items-center sm:justify-between lg:col-span-2">
+              <p className="text-sm leading-6 text-slate-500">
+                Next step uses this hypothesis to generate synthetic personas, then the segmentation service can classify the generated profiles.
+              </p>
               <button
                 type="button"
                 disabled={simulating}
                 onClick={onContinueToPersonaSetup}
-                className="focus-ring inline-flex w-full items-center justify-center gap-2 rounded-lg border border-bnz-200 bg-white px-4 py-3 text-sm font-bold text-bnz-700 shadow-sm transition hover:bg-bnz-50 disabled:cursor-not-allowed disabled:opacity-70"
+                className="focus-ring inline-flex items-center justify-center gap-2 rounded-lg border border-bnz-200 bg-white px-4 py-3 text-sm font-bold text-bnz-700 shadow-sm transition hover:bg-bnz-50 disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <UserRound className="h-4 w-4" />
-                Continue to Persona Setup
+                Continue to synthetic audience
+                <ArrowRight className="h-4 w-4" />
               </button>
+              </div>
             </div>
           </form>
           </div>
