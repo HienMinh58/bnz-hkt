@@ -210,3 +210,45 @@ export interface SimulationForm {
   personaCount: number;
   screenshot: File | null;
 }
+
+export type AdvisorChatRole = "user" | "assistant";
+
+export interface AdvisorChatMessage {
+  role: AdvisorChatRole;
+  content: string;
+}
+
+export interface AdvisorCampaignInput {
+  featureName: string;
+  featureDescription: string;
+  customerFacingCopy: string;
+  targetCustomerSegment: string;
+  channel: string;
+  shownTiming: string;
+  expectedCustomerAction: string;
+  dataUsedShared: string;
+  riskFocus: string[];
+  personaCount: number;
+  screenshotUploaded: boolean;
+  screenshotName: string | null;
+}
+
+export interface AdvisorChatRequest {
+  campaignInput: AdvisorCampaignInput;
+  personas: GeneratedPersona[];
+  simulationResult: SimulationResponse;
+  messages: AdvisorChatMessage[];
+}
+
+export interface AdvisorChatResponse {
+  answer: string;
+  suggestedPrompts: string[];
+  used_openai: boolean;
+  fallback_reason: string | null;
+  requestId?: string | null;
+  durationMs?: number | null;
+  openaiResponseId?: string | null;
+  openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
+  openaiDurationMs?: number | null;
+}

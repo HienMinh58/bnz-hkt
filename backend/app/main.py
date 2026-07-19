@@ -7,13 +7,16 @@ import urllib.request
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
+from app.auth import AuthenticatedUser, require_authenticated_user
 from app.models import (
     AdAnalysisRequest,
     AdAnalysisResponse,
+    AdvisorChatRequest,
+    AdvisorChatResponse,
     AudienceFitRequest,
     AudienceFitResponse,
     CustomerFeatureRecord,
@@ -27,6 +30,7 @@ from app.models import (
 )
 from app.openai_client import (
     analyze_ad_with_openai,
+    advise_on_simulation_with_openai,
     generate_synthetic_feature_profiles_with_openai,
     generate_personas_with_openai,
     simulate_with_openai,
@@ -40,11 +44,18 @@ app = FastAPI(title="Synthetic Customer Lab API")
 logger = logging.getLogger("synthetic_customer_lab")
 logging.basicConfig(level=logging.INFO)
 
+
+def _cors_origins_from_env() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        *_cors_origins_from_env(),
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -52,13 +63,23 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/api/personas", response_model=list[LegacyPersona])
-def get_personas() -> list[LegacyPersona]:
+def get_personas(
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> list[LegacyPersona]:
     return PERSONAS
 
 
 @app.post("/api/analyze-ad", response_model=AdAnalysisResponse)
-def analyze_ad(request: AdAnalysisRequest) -> AdAnalysisResponse:
+def analyze_ad(
+    request: AdAnalysisRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> AdAnalysisResponse:
     request_id = uuid4().hex
     endpoint_started_at = time.perf_counter()
     logger.info(
@@ -145,7 +166,10 @@ def analyze_ad(request: AdAnalysisRequest) -> AdAnalysisResponse:
 
 
 @app.post("/api/audience-fit", response_model=AudienceFitResponse)
-def audience_fit(request: AudienceFitRequest) -> AudienceFitResponse:
+def audience_fit(
+    request: AudienceFitRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> AudienceFitResponse:
     request_id = uuid4().hex
     endpoint_started_at = time.perf_counter()
     segmentation_url = _segmentation_service_url()
@@ -241,8 +265,55 @@ def audience_fit(request: AudienceFitRequest) -> AudienceFitResponse:
         ) from exc
 
 
+@app.post("/api/chat", response_model=AdvisorChatResponse)
+def advisor_chat(
+    request: AdvisorChatRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> AdvisorChatResponse:
+    request_id = uuid4().hex
+    endpoint_started_at = time.perf_counter()
+    logger.info(
+        "advisor_chat_request_received requestId=%s timestamp=%s messageCount=%s",
+        request_id,
+        _utc_timestamp(),
+        len(request.messages),
+    )
+    try:
+        result = advise_on_simulation_with_openai(request, request_id=request_id)
+        duration_ms = _duration_ms(endpoint_started_at)
+        logger.info(
+            "advisor_chat_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=True used_openai=%s",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            result.used_openai,
+        )
+        return result.model_copy(update={"requestId": request_id, "durationMs": duration_ms})
+    except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
+        fallback_reason = normalize_fallback_reason(exc)
+        logger.exception(
+            "advisor_chat_response_returned requestId=%s timestamp=%s durationMs=%s "
+            "success=False error=%r",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            fallback_reason,
+        )
+        return _fallback_advisor_response(
+            request=request,
+            request_id=request_id,
+            duration_ms=duration_ms,
+            fallback_reason=fallback_reason,
+        )
+
+
 @app.post("/api/generate-personas", response_model=GeneratePersonasResponse)
-def generate_personas(request: GeneratePersonasRequest) -> GeneratePersonasResponse:
+def generate_personas(
+    request: GeneratePersonasRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> GeneratePersonasResponse:
     request_id = uuid4().hex
     endpoint_started_at = time.perf_counter()
     request_received_at = _utc_timestamp()
@@ -333,6 +404,7 @@ async def run_simulation(
     sendTiming: str = Form(...),
     personas: str = Form(...),
     screenshot: UploadFile | None = File(default=None),
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> SimulationResultResponse:
     request_id = uuid4().hex
     endpoint_started_at = time.perf_counter()
@@ -502,6 +574,7 @@ async def simulate_compatibility(
     channel: str = Form(...),
     send_timing: str = Form(...),
     screenshot: UploadFile | None = File(default=None),
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
 ) -> SimulationResultResponse:
     request_id = uuid4().hex
     personas = build_mock_personas(
@@ -734,6 +807,39 @@ def _openai_error_status(error: str) -> int:
     if "validation" in lower or "json_parse" in lower:
         return 502
     return 502
+
+
+def _fallback_advisor_response(
+    request: AdvisorChatRequest,
+    request_id: str,
+    duration_ms: int,
+    fallback_reason: str,
+) -> AdvisorChatResponse:
+    latest_question = request.messages[-1].content
+    result = request.simulationResult
+    risks = "; ".join(result.topRisks[:4]) or "no top risks were provided"
+    recommendations = "; ".join(result.topRecommendations[:3])
+    answer = (
+        "I could not reach the AI advisor, so here is a local summary from the "
+        f"simulation result. Your question was: {latest_question}\n\n"
+        f"Launch decision: {result.overallDecision}.\n"
+        f"Main risks: {risks}.\n"
+        f"Most affected personas: {', '.join(result.topAffectedPersonas) or 'not specified'}.\n"
+        f"Recommended next steps: {recommendations}.\n\n"
+        "Retry the advisor for a more tailored answer."
+    )
+    return AdvisorChatResponse(
+        answer=answer,
+        suggestedPrompts=[
+            "What should we fix first?",
+            "Rewrite the message to reduce risk.",
+            "Which persona is most affected?",
+        ],
+        used_openai=False,
+        fallback_reason=fallback_reason,
+        requestId=request_id,
+        durationMs=duration_ms,
+    )
 
 
 def normalize_fallback_reason(exc: Exception) -> str:

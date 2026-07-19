@@ -1,6 +1,8 @@
 import type {
   AdAnalysisRequest,
   AdAnalysisResponse,
+  AdvisorChatRequest,
+  AdvisorChatResponse,
   AudienceFitRequest,
   AudienceFitResponse,
   FeatureTestInput,
@@ -9,11 +11,22 @@ import type {
   SimulationForm,
   SimulationResponse,
 } from "../types/simulation";
+import { supabase } from "./supabaseClient";
 
 const ANALYZE_AD_TIMEOUT_MS = 120_000;
 const AUDIENCE_FIT_TIMEOUT_MS = 240_000;
 const GENERATE_PERSONAS_TIMEOUT_MS = 330_000;
 const RUN_SIMULATION_TIMEOUT_MS = 330_000;
+const ADVISOR_CHAT_TIMEOUT_MS = 180_000;
+
+async function authHeaders(): Promise<Record<string, string>> {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) {
+    throw new Error("Please sign in before running a simulation.");
+  }
+  return { Authorization: `Bearer ${token}` };
+}
 
 function toLegacySimulationForm(form: FeatureTestInput | SimulationForm): SimulationForm {
   if ("customerFacingCopy" in form) {
@@ -59,6 +72,7 @@ export async function analyzeAd(
     const response = await fetch("/api/analyze-ad", {
       method: "POST",
       headers: {
+        ...(await authHeaders()),
         "Content-Type": "application/json",
       },
       signal: controller.signal,
@@ -134,6 +148,7 @@ export async function generateAudienceFit(
     const response = await fetch("/api/audience-fit", {
       method: "POST",
       headers: {
+        ...(await authHeaders()),
         "Content-Type": "application/json",
       },
       signal: controller.signal,
@@ -198,6 +213,7 @@ export async function generatePersonas(
     const response = await fetch("/api/generate-personas", {
       method: "POST",
       headers: {
+        ...(await authHeaders()),
         "Content-Type": "application/json",
       },
       signal: controller.signal,
@@ -295,6 +311,7 @@ export async function runSimulation(
   try {
     const response = await fetch("/api/run-simulation", {
       method: "POST",
+      headers: await authHeaders(),
       body,
       signal: controller.signal,
     });
@@ -356,6 +373,62 @@ export async function runSimulation(
         `Simulation timed out after ${Math.round(
           RUN_SIMULATION_TIMEOUT_MS / 1000,
         )} seconds. Try again with fewer personas, without an image, or retry later.`,
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+export async function askSimulationAdvisor(
+  request: AdvisorChatRequest,
+): Promise<AdvisorChatResponse> {
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    ADVISOR_CHAT_TIMEOUT_MS,
+  );
+
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: {
+        ...(await authHeaders()),
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(request),
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const requestId = detail?.requestId ?? payload?.requestId ?? null;
+      const error = detail?.error ?? payload?.error ?? "Advisor chat failed";
+      throw new Error(
+        requestId
+          ? `Advisor chat failed (${requestId}): ${error}`
+          : `Advisor chat failed: ${error}`,
+      );
+    }
+
+    console.info("/api/chat response received", {
+      requestId: payload?.requestId,
+      durationMs,
+      backendDurationMs: payload?.durationMs,
+      usedOpenAI: payload?.used_openai,
+      receivedAt: new Date().toISOString(),
+    });
+    return payload as AdvisorChatResponse;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(
+        `Advisor chat timed out after ${Math.round(
+          ADVISOR_CHAT_TIMEOUT_MS / 1000,
+        )} seconds. Try a shorter question or retry later.`,
       );
     }
     throw error;

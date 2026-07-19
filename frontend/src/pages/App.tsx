@@ -27,12 +27,15 @@ import ForceGraph2D, {
 } from "react-force-graph-2d";
 import {
   analyzeAd,
+  askSimulationAdvisor,
   generateAudienceFit,
   generatePersonas,
   runSimulation,
 } from "../api/client";
 import type {
   AdAnalysisResponse,
+  AdvisorCampaignInput,
+  AdvisorChatMessage,
   AudienceFitResponse,
   FeatureTestInput,
   GeneratedPersona,
@@ -1387,77 +1390,193 @@ function NodeDetailsPanel({
     const target = typeof link.target === "string" ? link.target : link.target.id;
     return source === node.id || target === node.id;
   }).length;
+  const personaProfileFields =
+    node.type === "persona" && node.persona
+      ? [
+          ["Age range", node.persona.ageRange],
+          ["Segment", node.persona.shortLabel],
+        ]
+      : [];
+  const personaAttributeFields =
+    node.type === "persona" && node.persona
+      ? [
+          ["Income pattern", node.persona.incomePattern],
+          ["Digital confidence", node.persona.digitalConfidence],
+          ["Language need", node.persona.languageNeed],
+          ["Accessibility need", node.persona.accessibilityNeed],
+          ["Financial stress", node.persona.financialStress],
+          ["Privacy sensitivity", node.persona.privacySensitivity],
+        ]
+      : [];
+  const personaConcernFields =
+    node.type === "persona" && node.persona
+      ? [
+          ["Main concern", node.persona.mainConcern],
+          ["Likely misunderstanding", node.persona.likelyMisunderstanding],
+        ]
+      : [];
+  const personaSupportFields =
+    node.type === "persona" && node.persona
+      ? [["Support need", node.persona.supportNeed]]
+      : [];
+  const propertyEntries =
+    node.type !== "persona" && node.properties
+      ? Object.entries(node.properties)
+      : [];
+
   return (
-    <div className="absolute right-4 top-16 z-30 w-80 rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-xs font-bold uppercase tracking-wide text-bnz-700">
-            Node Details
+    <div className="flex max-h-[620px] w-full flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-panel">
+      <div className="shrink-0 border-b border-slate-200 bg-white p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-xs font-bold uppercase tracking-wide text-bnz-700">
+              Node Details
+            </div>
+            <h3 className="mt-1 break-words text-lg font-bold leading-6 text-slate-950">
+              {node.label}
+            </h3>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Badge value={formatNodeType(node.type)} />
+              {node.riskLevel ? <Badge value={`${node.riskLevel} risk`} /> : null}
+            </div>
           </div>
-          <h3 className="mt-1 text-lg font-bold text-slate-950">{node.label}</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="shrink-0 rounded-md p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+            aria-label="Close node details"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="rounded-md p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-          aria-label="Close node details"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        {node.summary ? (
+          <p className="mt-3 rounded-lg border border-bnz-100 bg-bnz-50 p-3 text-sm leading-6 text-slate-700">
+            {node.summary}
+          </p>
+        ) : null}
       </div>
-      <div className="mt-3 flex flex-wrap gap-2">
-        <Badge value={formatNodeType(node.type)} />
-        {node.riskLevel ? <Badge value={`${node.riskLevel} risk`} /> : null}
-      </div>
-      <dl className="mt-4 space-y-2 text-sm text-slate-600">
-        <div className="flex justify-between gap-3">
-          <dt className="font-semibold text-slate-500">Type</dt>
-          <dd>{formatNodeType(node.type)}</dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="font-semibold text-slate-500">Connected nodes</dt>
-          <dd>{connectedCount}</dd>
-        </div>
-      </dl>
-      {node.summary ? (
-        <p className="mt-4 rounded-lg bg-slate-50 p-3 text-sm leading-6 text-slate-700">
-          {node.summary}
-        </p>
-      ) : null}
-      {node.type === "persona" && node.persona ? (
-        <dl className="mt-4 space-y-2 text-sm text-slate-600">
-          {[
-            ["Age range", node.persona.ageRange],
-            ["Segment", node.persona.shortLabel],
-            ["Income pattern", node.persona.incomePattern],
-            ["Digital confidence", node.persona.digitalConfidence],
-            ["Language need", node.persona.languageNeed],
-            ["Accessibility need", node.persona.accessibilityNeed],
-            ["Financial stress", node.persona.financialStress],
-            ["Privacy sensitivity", node.persona.privacySensitivity],
-            ["Main concern", node.persona.mainConcern],
-            ["Likely misunderstanding", node.persona.likelyMisunderstanding],
-            ["Support need", node.persona.supportNeed],
-          ].map(([label, value]) => (
-            <div key={label}>
-              <dt className="font-semibold text-slate-500">{label}</dt>
-              <dd className="mt-0.5 leading-5">{value}</dd>
-            </div>
-          ))}
-        </dl>
-      ) : null}
-      {node.type !== "persona" && node.properties ? (
-        <dl className="mt-4 space-y-2 text-sm text-slate-600">
-          {Object.entries(node.properties).map(([key, value]) => (
-            <div key={key} className="flex justify-between gap-3">
-              <dt className="font-semibold capitalize text-slate-500">
-                {key.replace(/([A-Z])/g, " $1")}
+
+      <div className="node-detail-scroll min-h-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden p-4">
+        <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div className="mb-3 flex items-center gap-2">
+            <UserRound className="h-4 w-4 text-bnz-600" />
+            <h4 className="text-sm font-bold text-slate-950">Profile overview</h4>
+          </div>
+          <dl className="grid grid-cols-2 gap-3 text-sm">
+            <div>
+              <dt className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                Type
               </dt>
-              <dd className="text-right">{value}</dd>
+              <dd className="mt-1 break-words font-semibold leading-5 text-slate-800">
+                {formatNodeType(node.type)}
+              </dd>
             </div>
-          ))}
-        </dl>
-      ) : null}
+            <div>
+              <dt className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                Connected nodes
+              </dt>
+              <dd className="mt-1 break-words font-semibold leading-5 text-slate-800">
+                {connectedCount}
+              </dd>
+            </div>
+            {personaProfileFields.map(([label, value]) => (
+              <div key={label}>
+                <dt className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                  {label}
+                </dt>
+                <dd className="mt-1 break-words font-semibold leading-5 text-slate-800">
+                  {value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+
+        {personaAttributeFields.length || propertyEntries.length ? (
+          <section className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <Network className="h-4 w-4 text-bnz-600" />
+              <h4 className="text-sm font-bold text-slate-950">
+                Financial and behavioural attributes
+              </h4>
+            </div>
+            <dl className="grid grid-cols-2 gap-3 text-sm">
+              {personaAttributeFields.map(([label, value]) => (
+                <div key={label}>
+                  <dt className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                    {label}
+                  </dt>
+                  <dd className="mt-1 break-words leading-5 text-slate-800">
+                    {value}
+                  </dd>
+                </div>
+              ))}
+              {propertyEntries.map(([key, value]) => (
+                <div key={key}>
+                  <dt className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                    {key.replace(/([A-Z])/g, " $1")}
+                  </dt>
+                  <dd className="mt-1 break-words leading-5 text-slate-800">
+                    {value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        ) : null}
+
+        {personaConcernFields.length ? (
+          <section className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-600" />
+              <h4 className="text-sm font-bold text-slate-950">
+                Concerns and misunderstandings
+              </h4>
+            </div>
+            <div className="space-y-3">
+              {personaConcernFields.map(([label, value]) => (
+                <div
+                  key={label}
+                  className="rounded-lg border border-amber-200 bg-white p-3"
+                >
+                  <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                    {label}
+                  </div>
+                  <p className="mt-1 break-words text-sm leading-6 text-slate-800">
+                    {value}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        {personaSupportFields.length ? (
+          <section className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-emerald-700" />
+              <h4 className="text-sm font-bold text-slate-950">
+                Support needs and recommendation
+              </h4>
+            </div>
+            <div className="space-y-3">
+              {personaSupportFields.map(([label, value]) => (
+                <div
+                  key={label}
+                  className="rounded-lg border border-emerald-200 bg-white p-3"
+                >
+                  <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                    {label}
+                  </div>
+                  <p className="mt-1 break-words text-sm leading-6 text-slate-800">
+                    {value}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1484,13 +1603,11 @@ function PersonaTooltip({ persona }: { persona: GeneratedPersona }) {
 function PersonaNetwork({
   form,
   personas,
-  selectedPersona,
   simulation,
   onSelect,
 }: {
   form: FeatureTestInput;
   personas: GeneratedPersona[];
-  selectedPersona: GeneratedPersona | null;
   simulation: SimulationResponse | null;
   onSelect: (persona: GeneratedPersona) => void;
 }) {
@@ -1632,56 +1749,22 @@ function PersonaNetwork({
           ) : null}
 
           <GraphLegend graphData={graphData} />
-          {selectedNode ? (
-            <NodeDetailsPanel
-              node={selectedNode}
-              graphData={graphData}
-              onClose={() => setSelectedNode(null)}
-            />
-          ) : null}
         </div>
 
-        <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-          {selectedPersona ? (
-            <div>
-              <h3 className="text-lg font-bold text-slate-950">
-                {selectedPersona.name}
-              </h3>
-              <p className="text-sm font-medium text-bnz-700">
-                {selectedPersona.ageRange} · {selectedPersona.shortLabel}
-              </p>
-              <dl className="mt-4 space-y-2 text-sm text-slate-600">
-                {[
-                  ["Income pattern", selectedPersona.incomePattern],
-                  ["Digital confidence", selectedPersona.digitalConfidence],
-                  ["Language need", selectedPersona.languageNeed],
-                  ["Accessibility need", selectedPersona.accessibilityNeed],
-                  ["Financial stress", selectedPersona.financialStress],
-                  ["Privacy sensitivity", selectedPersona.privacySensitivity],
-                ].map(([label, value]) => (
-                  <div key={label} className="flex justify-between gap-3">
-                    <dt className="font-semibold text-slate-500">{label}</dt>
-                    <dd className="text-right">{value}</dd>
-                  </div>
-                ))}
-              </dl>
-              <div className="mt-4 rounded-lg bg-white p-3">
-                <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
-                  Main concern
-                </div>
-                <p className="mt-1 text-sm leading-6 text-slate-700">
-                  {selectedPersona.mainConcern}
-                </p>
-              </div>
-              <p className="mt-4 text-sm leading-6 text-slate-600">
-                {selectedPersona.lifeContext}
-              </p>
-            </div>
-          ) : (
+        <div>
+        {selectedNode ? (
+          <NodeDetailsPanel
+            node={selectedNode}
+            graphData={graphData}
+            onClose={() => setSelectedNode(null)}
+          />
+        ) : (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
             <div className="text-sm leading-6 text-slate-600">
-              Click a persona node to inspect the full generated profile.
+              Click a node to inspect its details.
             </div>
-          )}
+          </div>
+        )}
         </div>
       </div>
     </section>
@@ -2097,7 +2180,6 @@ function AutoGeneratePersonaStep({
         <PersonaNetwork
           form={form}
           personas={generatedPersonas}
-          selectedPersona={selectedGeneratedPersona}
           simulation={result}
           onSelect={onSelectGeneratedPersona}
         />
@@ -2421,7 +2503,7 @@ function Results({ result }: { result: SimulationResponse }) {
         )}
         {result.scoreDiffs && Object.keys(result.scoreDiffs).length ? (
           <p className="mt-4 text-xs font-medium text-slate-500">
-            Final score cards include rule-based adjustments. Open the development debug panel for score diffs.
+            Final score cards include rule-based adjustments.
           </p>
         ) : null}
       </div>
@@ -2512,58 +2594,196 @@ function Results({ result }: { result: SimulationResponse }) {
         </div>
       ) : null}
 
-      {isDevelopmentMode() ? <SimulationDebugPanel result={result} /> : null}
     </section>
   );
 }
 
-function isDevelopmentMode() {
-  return Boolean(
-    (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV,
-  );
+const defaultAdvisorPrompts = [
+  "What are the top 3 launch risks?",
+  "Rewrite the message to reduce stress.",
+  "Which persona is most likely to misunderstand this?",
+  "Create a short A/B test plan.",
+];
+
+function advisorCampaignInput(form: FeatureTestInput): AdvisorCampaignInput {
+  return {
+    featureName: form.featureName,
+    featureDescription: form.featureDescription,
+    customerFacingCopy: form.customerFacingCopy,
+    targetCustomerSegment: form.targetCustomerSegment,
+    channel: form.channel,
+    shownTiming: form.shownTiming,
+    expectedCustomerAction: form.expectedCustomerAction,
+    dataUsedShared: form.dataUsedShared,
+    riskFocus: form.riskFocus,
+    personaCount: form.personaCount,
+    screenshotUploaded: Boolean(form.screenshot),
+    screenshotName: form.screenshot?.name ?? null,
+  };
 }
 
-function SimulationDebugPanel({ result }: { result: SimulationResponse }) {
+function advisorSimulationResult(result: SimulationResponse): SimulationResponse {
   const {
-    rawOpenAIResult,
-    ruleBasedChecks,
-    scoreDiffs,
-    used_openai,
-    fallback_reason,
-    developmentDebug,
-    ...finalDisplayedResult
+    rawOpenAIResult: _rawOpenAIResult,
+    developmentDebug: _developmentDebug,
+    openaiResponseId: _openaiResponseId,
+    openaiAttempts: _openaiAttempts,
+    openaiAttemptResponseIds: _openaiAttemptResponseIds,
+    ...safeResult
   } = result;
-  const debugPayload = {
-    requestId: developmentDebug?.requestId,
-    imageUploaded: developmentDebug?.imageUploaded,
-    personaCount: developmentDebug?.personaCount,
-    personaNames: developmentDebug?.personaNames,
-    hasRawOpenAIResult: developmentDebug?.hasRawOpenAIResult,
-    openaiResponseId: developmentDebug?.openaiResponseId,
-    openaiAttempts: developmentDebug?.openaiAttempts,
-    openaiAttemptResponseIds: developmentDebug?.openaiAttemptResponseIds,
-    durationMs: developmentDebug?.durationMs,
-    openaiDurationMs: developmentDebug?.openaiDurationMs,
-    postProcessingDurationMs: developmentDebug?.postProcessingDurationMs,
-    postProcessingWarning: developmentDebug?.postProcessingWarning,
-    rawOpenAIResult,
-    developmentDebug,
-    ruleBasedChecks,
-    finalDisplayedResult,
-    scoreDiffs,
-    used_openai,
-    fallback_reason,
-  };
+  return safeResult;
+}
+
+function SimulationAdvisorChat({
+  form,
+  personas,
+  result,
+}: {
+  form: FeatureTestInput;
+  personas: GeneratedPersona[];
+  result: SimulationResponse;
+}) {
+  const [messages, setMessages] = useState<AdvisorChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [suggestedPrompts, setSuggestedPrompts] = useState(defaultAdvisorPrompts);
+  const [sending, setSending] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const resultKey = result.requestId ?? result.developmentDebug?.requestId ?? result.overallSummary;
+
+  useEffect(() => {
+    setMessages([]);
+    setInput("");
+    setChatError(null);
+    setSuggestedPrompts(defaultAdvisorPrompts);
+  }, [resultKey]);
+
+  async function sendMessage(content: string) {
+    const question = content.trim();
+    if (!question || sending) return;
+
+    const nextMessages: AdvisorChatMessage[] = [
+      ...messages,
+      { role: "user" as const, content: question },
+    ].slice(-12);
+
+    setMessages(nextMessages);
+    setInput("");
+    setSending(true);
+    setChatError(null);
+
+    try {
+      const response = await askSimulationAdvisor({
+        campaignInput: advisorCampaignInput(form),
+        personas,
+        simulationResult: advisorSimulationResult(result),
+        messages: nextMessages,
+      });
+      setMessages((current) => [
+        ...current,
+        { role: "assistant" as const, content: response.answer },
+      ].slice(-12));
+      if (response.suggestedPrompts.length) {
+        setSuggestedPrompts(response.suggestedPrompts);
+      }
+      if (!response.used_openai && response.fallback_reason) {
+        setChatError(`Advisor fallback: ${response.fallback_reason}`);
+      }
+    } catch (err) {
+      setChatError(err instanceof Error ? err.message : "Advisor chat failed");
+      setMessages(messages);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void sendMessage(input);
+  }
 
   return (
-    <details className="rounded-lg border border-dashed border-slate-300 bg-white p-5 text-sm shadow-panel">
-      <summary className="cursor-pointer font-bold text-slate-950">
-        Development debug
-      </summary>
-      <pre className="mt-4 max-h-96 overflow-auto rounded-lg bg-slate-950 p-4 text-xs leading-5 text-slate-100">
-        {JSON.stringify(debugPayload, null, 2)}
-      </pre>
-    </details>
+    <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold text-bnz-700">
+            <BrainCircuit className="h-4 w-4" />
+            Simulation advisor
+          </div>
+          <h2 className="mt-2 text-lg font-bold text-slate-950">
+            Ask about this simulation
+          </h2>
+        </div>
+        <Badge value="Context-bound chat" />
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        {suggestedPrompts.map((prompt) => (
+          <button
+            key={prompt}
+            type="button"
+            disabled={sending}
+            onClick={() => void sendMessage(prompt)}
+            className="rounded-lg border border-bnz-100 bg-bnz-50 px-3 py-1.5 text-xs font-bold text-bnz-700 hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {prompt}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-5 max-h-96 space-y-3 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-4">
+        {messages.length ? (
+          messages.map((message, index) => (
+            <div
+              key={`${message.role}-${index}`}
+              className={
+                message.role === "user"
+                  ? "ml-auto max-w-3xl rounded-lg border border-bnz-100 bg-white p-3 text-sm leading-6 text-slate-800"
+                  : "mr-auto max-w-3xl rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-sm leading-6 text-slate-800"
+              }
+            >
+              <div className="mb-1 text-xs font-bold uppercase text-slate-500">
+                {message.role === "user" ? "You" : "Advisor"}
+              </div>
+              <div className="whitespace-pre-wrap">{message.content}</div>
+            </div>
+          ))
+        ) : (
+          <p className="text-sm leading-6 text-slate-600">
+            Ask a targeted question about the current simulation result, personas,
+            risks, copy, or launch readiness.
+          </p>
+        )}
+        {sending ? (
+          <div className="mr-auto max-w-3xl rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-sm font-semibold text-slate-700">
+            Thinking...
+          </div>
+        ) : null}
+      </div>
+
+      {chatError ? (
+        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
+          {chatError}
+        </div>
+      ) : null}
+
+      <form className="mt-4 flex flex-col gap-3 sm:flex-row" onSubmit={onSubmit}>
+        <input
+          className="min-w-0 flex-1 rounded-lg border px-3 py-2.5 text-sm"
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          placeholder="Ask what to fix first, request a rewrite, or compare personas..."
+          disabled={sending}
+        />
+        <button
+          className="focus-ring inline-flex items-center justify-center gap-2 rounded-lg bg-bnz-700 px-4 py-2.5 text-sm font-bold text-white shadow-sm hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-60"
+          type="submit"
+          disabled={sending || !input.trim()}
+        >
+          <ArrowRight className="h-4 w-4" />
+          Send
+        </button>
+      </form>
+    </section>
   );
 }
 
@@ -3362,6 +3582,11 @@ export default function App() {
                   </button>
                 </div>
                 <Results result={result} />
+                <SimulationAdvisorChat
+                  form={form}
+                  personas={personas}
+                  result={result}
+                />
               </>
             )}
           </div>

@@ -13,6 +13,8 @@ from pydantic import BaseModel
 
 from app.models import (
     AdAnalysisResponse,
+    AdvisorChatRequest,
+    AdvisorChatResponse,
     SyntheticFeatureProfilesResponse,
     GeneratePersonasResponse,
     GeneratedPersona,
@@ -56,6 +58,8 @@ def _schema_for(model: Type[BaseModel]) -> dict:
         _remove_generate_personas_runtime_fields(schema)
     if model is AdAnalysisResponse:
         _remove_ad_analysis_runtime_fields(schema)
+    if model is AdvisorChatResponse:
+        _remove_advisor_chat_runtime_fields(schema)
     _make_openai_strict_schema(schema)
     return schema
 
@@ -93,6 +97,16 @@ RUNTIME_RESULT_FIELDS = {
 }
 
 
+ADVISOR_CHAT_RUNTIME_FIELDS = {
+    "requestId",
+    "durationMs",
+    "openaiResponseId",
+    "openaiAttempts",
+    "openaiAttemptResponseIds",
+    "openaiDurationMs",
+}
+
+
 def _remove_generate_personas_runtime_fields(schema: dict) -> None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
@@ -116,6 +130,14 @@ def _remove_runtime_result_fields(schema: dict) -> None:
             continue
         for field in RUNTIME_RESULT_FIELDS:
             properties.pop(field, None)
+
+
+def _remove_advisor_chat_runtime_fields(schema: dict) -> None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    for field in ADVISOR_CHAT_RUNTIME_FIELDS:
+        properties.pop(field, None)
 
 
 def _make_openai_strict_schema(node: dict) -> None:
@@ -549,6 +571,79 @@ Feature guidance:
     parsed.used_openai = True
     parsed.fallback_reason = None
     return parsed, openai_result
+
+
+def advise_on_simulation_with_openai(
+    request: AdvisorChatRequest,
+    request_id: str | None = None,
+) -> AdvisorChatResponse:
+    context = request.model_dump(
+        exclude={
+            "simulationResult": {
+                "rawOpenAIResult",
+                "developmentDebug",
+                "openaiResponseId",
+                "openaiAttempts",
+                "openaiAttemptResponseIds",
+            }
+        }
+    )
+    prompt = f"""
+You are a banking pre-launch risk advisor for a synthetic customer lab.
+Answer the user's latest question using only the provided campaign, personas,
+simulation result, and chat history.
+
+Rules:
+- Do not provide legal, regulatory, or compliance approval.
+- Do not claim synthetic personas represent real customers.
+- If the user asks outside the provided context, say what information is missing.
+- Be concrete and action-oriented. Prefer bullets when comparing risks or changes.
+- Focus on clarity, trust, stress, fairness, accessibility, privacy, financial
+  wellbeing, operational risk, and customer understanding.
+- If asked to rewrite copy, provide the revised copy plus a short rationale.
+- Keep the answer under 600 words.
+- Set used_openai to true and fallback_reason to null.
+- Return valid JSON only.
+
+Simulation context JSON:
+{json.dumps(context, indent=2)}
+"""
+    openai_result = _responses_create_with_retry(
+        request_id=request_id,
+        endpoint="simulation-advisor-chat",
+        persona_count=len(request.personas),
+        image_uploaded=request.campaignInput.screenshotUploaded,
+        model=_model(),
+        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "advisor_chat_response",
+                "schema": _schema_for(AdvisorChatResponse),
+                "strict": True,
+            }
+        },
+    )
+    try:
+        parsed = AdvisorChatResponse.model_validate_json(
+            openai_result.response.output_text
+        )
+    except Exception as exc:
+        setattr(exc, "attempts", openai_result.attempts)
+        setattr(exc, "openai_response_ids", openai_result.response_ids)
+        setattr(exc, "openai_response_id", getattr(openai_result.response, "id", None))
+        setattr(exc, "openai_duration_ms", openai_result.duration_ms)
+        raise
+    return parsed.model_copy(
+        update={
+            "used_openai": True,
+            "fallback_reason": None,
+            "openaiResponseId": getattr(openai_result.response, "id", None),
+            "openaiAttempts": openai_result.attempts,
+            "openaiAttemptResponseIds": openai_result.response_ids,
+            "openaiDurationMs": openai_result.duration_ms,
+        }
+    )
 
 
 def simulate_with_openai(

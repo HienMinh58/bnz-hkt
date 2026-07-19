@@ -239,3 +239,43 @@ class SimulationResultResponse(StrictBaseModel):
     developmentDebug: DevelopmentDebug | None = None
     used_openai: bool
     fallback_reason: str | None
+
+
+class AdvisorChatMessage(StrictBaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=6000)
+
+
+class AdvisorCampaignInput(StrictBaseModel):
+    featureName: str
+    featureDescription: str
+    customerFacingCopy: str
+    targetCustomerSegment: str
+    channel: str
+    shownTiming: str
+    expectedCustomerAction: str
+    dataUsedShared: str
+    riskFocus: list[str]
+    personaCount: int
+    screenshotUploaded: bool = False
+    screenshotName: str | None = None
+
+
+class AdvisorChatRequest(StrictBaseModel):
+    campaignInput: AdvisorCampaignInput
+    personas: list[GeneratedPersona] = Field(min_length=1, max_length=100)
+    simulationResult: SimulationResultResponse
+    messages: list[AdvisorChatMessage] = Field(min_length=1, max_length=12)
+
+
+class AdvisorChatResponse(StrictBaseModel):
+    answer: str
+    suggestedPrompts: list[str] = Field(min_length=0, max_length=4)
+    used_openai: bool
+    fallback_reason: str | None
+    requestId: str | None = None
+    durationMs: int | None = None
+    openaiResponseId: str | None = None
+    openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
+    openaiDurationMs: int | None = None
