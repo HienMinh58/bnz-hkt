@@ -186,6 +186,24 @@ export interface SimulationResponse {
   fallback_reason: string | null;
 }
 
+export type SimulationJobStatus = "queued" | "running" | "completed" | "failed";
+
+export interface SimulationJobCreateResponse {
+  jobId: string;
+  status: SimulationJobStatus;
+  requestId: string;
+}
+
+export interface SimulationJobStatusResponse {
+  jobId: string;
+  status: SimulationJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  requestId: string;
+  error?: string | null;
+  result?: SimulationResponse | null;
+}
+
 export interface FeatureTestInput {
   featureName: string;
   featureDescription: string;

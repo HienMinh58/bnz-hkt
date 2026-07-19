@@ -8,6 +8,8 @@ import type {
   FeatureTestInput,
   GeneratePersonasResponse,
   GeneratedPersona,
+  SimulationJobCreateResponse,
+  SimulationJobStatusResponse,
   SimulationForm,
   SimulationResponse,
 } from "../types/simulation";
@@ -17,6 +19,9 @@ const ANALYZE_AD_TIMEOUT_MS = 120_000;
 const AUDIENCE_FIT_TIMEOUT_MS = 240_000;
 const GENERATE_PERSONAS_TIMEOUT_MS = 330_000;
 const RUN_SIMULATION_TIMEOUT_MS = 330_000;
+const CREATE_SIMULATION_JOB_TIMEOUT_MS = 60_000;
+const SIMULATION_JOB_POLL_INTERVAL_MS = 3_000;
+const SIMULATION_JOB_POLL_TIMEOUT_MS = 10 * 60_000;
 const ADVISOR_CHAT_TIMEOUT_MS = 180_000;
 
 async function authHeaders(): Promise<Record<string, string>> {
@@ -51,6 +56,12 @@ function toLegacySimulationForm(form: FeatureTestInput | SimulationForm): Simula
     };
   }
   return form;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 export async function analyzeAd(
@@ -287,7 +298,7 @@ export async function runSimulation(
   const controller = new AbortController();
   const timeoutId = window.setTimeout(
     () => controller.abort(),
-    RUN_SIMULATION_TIMEOUT_MS,
+    CREATE_SIMULATION_JOB_TIMEOUT_MS,
   );
   const body = new FormData();
   body.append("featureName", legacyForm.featureName);
@@ -300,16 +311,16 @@ export async function runSimulation(
     body.append("screenshot", legacyForm.screenshot);
   }
 
-  console.info("/api/run-simulation request started", {
+  console.info("/api/run-simulation-jobs request started", {
     featureName: legacyForm.featureName,
     personaCount: personas.length,
     imageUploaded: Boolean(legacyForm.screenshot),
     startedAt: new Date().toISOString(),
-    timeoutMs: RUN_SIMULATION_TIMEOUT_MS,
+    timeoutMs: CREATE_SIMULATION_JOB_TIMEOUT_MS,
   });
 
   try {
-    const response = await fetch("/api/run-simulation", {
+    const response = await fetch("/api/run-simulation-jobs", {
       method: "POST",
       headers: await authHeaders(),
       body,
@@ -321,9 +332,10 @@ export async function runSimulation(
     if (!response.ok) {
       const detail = payload?.detail;
       const requestId = detail?.requestId ?? payload?.requestId ?? null;
-      const error = detail?.error ?? payload?.error ?? "Simulation failed";
+      const error =
+        detail?.error ?? payload?.error ?? "Simulation job creation failed";
       const backendDurationMs = detail?.durationMs ?? payload?.durationMs ?? null;
-      console.error("/api/run-simulation request failed", {
+      console.error("/api/run-simulation-jobs request failed", {
         requestId,
         status: response.status,
         error,
@@ -337,48 +349,87 @@ export async function runSimulation(
       });
       throw new Error(
         requestId
-          ? `Simulation failed (${requestId}): ${error}`
-          : `Simulation failed: ${error}`,
+          ? `Simulation job creation failed (${requestId}): ${error}`
+          : `Simulation job creation failed: ${error}`,
       );
     }
 
-    const data = payload as SimulationResponse;
-    console.info("/api/run-simulation response received", {
-      requestId: data.requestId ?? data.developmentDebug?.requestId,
+    const job = payload as SimulationJobCreateResponse;
+    console.info("/api/run-simulation-jobs response received", {
+      jobId: job.jobId,
+      requestId: job.requestId,
       durationMs,
-      backendDurationMs: data.durationMs ?? data.developmentDebug?.durationMs,
-      openaiDurationMs:
-        data.openaiDurationMs ?? data.developmentDebug?.openaiDurationMs,
-      postProcessingDurationMs:
-        data.postProcessingDurationMs ??
-        data.developmentDebug?.postProcessingDurationMs,
-      openaiAttempts: data.openaiAttempts ?? data.developmentDebug?.openaiAttempts,
-      openaiResponseId:
-        data.openaiResponseId ?? data.developmentDebug?.openaiResponseId,
-      openaiAttemptResponseIds:
-        data.openaiAttemptResponseIds ??
-        data.developmentDebug?.openaiAttemptResponseIds,
       receivedAt: new Date().toISOString(),
     });
-    return data;
+    return await pollSimulationJob(job.jobId, startedAt);
   } catch (error) {
     const durationMs = Math.round(performance.now() - startedAt);
     if (error instanceof DOMException && error.name === "AbortError") {
-      console.error("/api/run-simulation request timed out", {
+      console.error("/api/run-simulation-jobs request timed out", {
         durationMs,
-        timeoutMs: RUN_SIMULATION_TIMEOUT_MS,
+        timeoutMs: CREATE_SIMULATION_JOB_TIMEOUT_MS,
         receivedAt: new Date().toISOString(),
       });
       throw new Error(
-        `Simulation timed out after ${Math.round(
-          RUN_SIMULATION_TIMEOUT_MS / 1000,
-        )} seconds. Try again with fewer personas, without an image, or retry later.`,
+        `Simulation job creation timed out after ${Math.round(
+          CREATE_SIMULATION_JOB_TIMEOUT_MS / 1000,
+        )} seconds. Try again or retry later.`,
       );
     }
     throw error;
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+async function pollSimulationJob(
+  jobId: string,
+  startedAt: number,
+): Promise<SimulationResponse> {
+  while (performance.now() - startedAt < SIMULATION_JOB_POLL_TIMEOUT_MS) {
+    await delay(SIMULATION_JOB_POLL_INTERVAL_MS);
+    const response = await fetch(`/api/run-simulation-jobs/${jobId}`, {
+      method: "GET",
+      headers: await authHeaders(),
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const error = detail?.error ?? detail ?? payload?.error ?? "Simulation failed";
+      console.error("/api/run-simulation-jobs poll failed", {
+        jobId,
+        status: response.status,
+        error,
+        durationMs,
+        receivedAt: new Date().toISOString(),
+      });
+      throw new Error(`Simulation failed: ${error}`);
+    }
+
+    const job = payload as SimulationJobStatusResponse;
+    console.info("/api/run-simulation-jobs poll received", {
+      jobId,
+      status: job.status,
+      requestId: job.requestId,
+      durationMs,
+      receivedAt: new Date().toISOString(),
+    });
+
+    if (job.status === "completed" && job.result) {
+      return job.result;
+    }
+    if (job.status === "failed") {
+      throw new Error(`Simulation failed: ${job.error ?? "Unknown error"}`);
+    }
+  }
+
+  throw new Error(
+    `Simulation is still running after ${Math.round(
+      SIMULATION_JOB_POLL_TIMEOUT_MS / 1000,
+    )} seconds. Try again with fewer personas or without an image.`,
+  );
 }
 
 export async function askSimulationAdvisor(

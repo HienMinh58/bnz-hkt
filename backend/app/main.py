@@ -5,9 +5,10 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from threading import RLock
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
@@ -26,6 +27,8 @@ from app.models import (
     LegacyPersona,
     SegmentFitSummary,
     DevelopmentDebug,
+    SimulationJobCreateResponse,
+    SimulationJobStatusResponse,
     SimulationResultResponse,
 )
 from app.openai_client import (
@@ -43,6 +46,10 @@ from app.scoring import build_mock_simulation
 app = FastAPI(title="Synthetic Customer Lab API")
 logger = logging.getLogger("synthetic_customer_lab")
 logging.basicConfig(level=logging.INFO)
+SIMULATION_JOBS: dict[str, dict] = {}
+SIMULATION_JOBS_LOCK = RLock()
+SIMULATION_JOB_TTL_SECONDS = 60 * 60
+SIMULATION_JOB_LIMIT = 100
 
 
 def _cors_origins_from_env() -> list[str]:
@@ -395,6 +402,96 @@ def generate_personas(
         ) from exc
 
 
+@app.post("/api/run-simulation-jobs", response_model=SimulationJobCreateResponse)
+async def create_simulation_job(
+    background_tasks: BackgroundTasks,
+    featureName: str = Form(...),
+    bankingMessage: str = Form(...),
+    targetCustomers: str = Form(...),
+    channel: str = Form(...),
+    sendTiming: str = Form(...),
+    personas: str = Form(...),
+    screenshot: UploadFile | None = File(default=None),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> SimulationJobCreateResponse:
+    request_id = uuid4().hex
+    job_id = f"sim_{uuid4().hex}"
+    endpoint_started_at = time.perf_counter()
+    generated_personas = _parse_personas(personas, request_id)
+    image_bytes = None
+    image_content_type = None
+    if screenshot is not None:
+        image_bytes = await screenshot.read()
+        image_content_type = screenshot.content_type
+    persona_names = [persona.name for persona in generated_personas]
+    now = _utc_timestamp()
+    now_epoch = time.time()
+
+    with SIMULATION_JOBS_LOCK:
+        _cleanup_simulation_jobs_locked(now_epoch)
+        SIMULATION_JOBS[job_id] = {
+            "jobId": job_id,
+            "requestId": request_id,
+            "userId": user.id,
+            "status": "queued",
+            "createdAt": now,
+            "updatedAt": now,
+            "createdAtEpoch": now_epoch,
+            "updatedAtEpoch": now_epoch,
+            "error": None,
+            "result": None,
+        }
+
+    logger.info(
+        "simulation_job_created jobId=%s requestId=%s timestamp=%s "
+        "featureName=%r personaCount=%s personaNames=%s imageUploaded=%s",
+        job_id,
+        request_id,
+        now,
+        featureName,
+        len(persona_names),
+        persona_names,
+        image_bytes is not None,
+    )
+    background_tasks.add_task(
+        _run_simulation_job,
+        job_id,
+        request_id,
+        endpoint_started_at,
+        featureName,
+        bankingMessage,
+        targetCustomers,
+        channel,
+        sendTiming,
+        generated_personas,
+        image_bytes,
+        image_content_type,
+    )
+    return SimulationJobCreateResponse(
+        jobId=job_id,
+        status="queued",
+        requestId=request_id,
+    )
+
+
+@app.get(
+    "/api/run-simulation-jobs/{job_id}",
+    response_model=SimulationJobStatusResponse,
+)
+def get_simulation_job(
+    job_id: str,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> SimulationJobStatusResponse:
+    with SIMULATION_JOBS_LOCK:
+        _cleanup_simulation_jobs_locked(time.time())
+        job = SIMULATION_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Simulation job not found")
+        if job["userId"] != user.id:
+            raise HTTPException(status_code=404, detail="Simulation job not found")
+        return _simulation_job_response(job)
+
+
 @app.post("/api/run-simulation", response_model=SimulationResultResponse)
 async def run_simulation(
     featureName: str = Form(...),
@@ -657,6 +754,209 @@ async def simulate_compatibility(
             image_uploaded=image_uploaded,
             persona_names=persona_names,
         )
+
+
+def _run_simulation_job(
+    job_id: str,
+    request_id: str,
+    endpoint_started_at: float,
+    feature_name: str,
+    banking_message: str,
+    target_customers: str,
+    channel: str,
+    send_timing: str,
+    generated_personas: list[GeneratedPersona],
+    image_bytes: bytes | None,
+    image_content_type: str | None,
+) -> None:
+    image_uploaded = image_bytes is not None
+    persona_names = [persona.name for persona in generated_personas]
+    _update_simulation_job(
+        job_id,
+        status="running",
+        error=None,
+        result=None,
+    )
+    _log_simulation_event(
+        request_id=request_id,
+        feature_name=feature_name,
+        persona_names=persona_names,
+        image_uploaded=image_uploaded,
+        openai_called=False,
+        openai_succeeded=False,
+        used_openai=False,
+        fallback_reason=None,
+    )
+
+    openai_started_at: float | None = None
+    try:
+        openai_started_at = time.perf_counter()
+        logger.info(
+            "simulation_job_openai_start jobId=%s requestId=%s timestamp=%s",
+            job_id,
+            request_id,
+            _utc_timestamp(),
+        )
+        result = simulate_with_openai(
+            personas=generated_personas,
+            feature_name=feature_name,
+            banking_message=banking_message,
+            target_customers=target_customers,
+            channel=channel,
+            send_timing=send_timing,
+            image_bytes=image_bytes,
+            image_content_type=image_content_type,
+            request_id=request_id,
+        )
+        duration_ms = _duration_ms(endpoint_started_at)
+        openai_duration_ms = result.openaiDurationMs or _duration_ms(openai_started_at)
+        result = result.model_copy(
+            update={
+                "requestId": request_id,
+                "durationMs": duration_ms,
+                "openaiDurationMs": openai_duration_ms,
+            }
+        )
+        result = _with_development_debug(
+            result=result,
+            request_id=request_id,
+            image_uploaded=image_uploaded,
+            persona_names=persona_names,
+        )
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=feature_name,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=True,
+            used_openai=result.used_openai,
+            fallback_reason=result.fallback_reason,
+            openai_attempts=result.openaiAttempts,
+            openai_response_id=result.openaiResponseId,
+            post_processing_warning=result.postProcessingWarning,
+        )
+        _update_simulation_job(
+            job_id,
+            status="completed",
+            error=None,
+            result=result,
+        )
+        logger.info(
+            "simulation_job_completed jobId=%s requestId=%s timestamp=%s durationMs=%s",
+            job_id,
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+        )
+    except Exception as exc:
+        duration_ms = _duration_ms(endpoint_started_at)
+        fallback_reason = normalize_fallback_reason(exc)
+        openai_attempts = getattr(exc, "attempts", None)
+        openai_response_id = getattr(exc, "openai_response_id", None)
+        openai_response_ids = getattr(exc, "openai_response_ids", None)
+        openai_duration_ms = getattr(exc, "openai_duration_ms", None)
+        if openai_started_at is not None:
+            logger.info(
+                "simulation_job_openai_end jobId=%s requestId=%s timestamp=%s "
+                "openaiDurationMs=%s success=False openaiAttempts=%s "
+                "openaiResponseId=%r openaiAttemptResponseIds=%s error=%r",
+                job_id,
+                request_id,
+                _utc_timestamp(),
+                openai_duration_ms or _duration_ms(openai_started_at),
+                openai_attempts,
+                openai_response_id,
+                openai_response_ids,
+                fallback_reason,
+            )
+        _log_simulation_event(
+            request_id=request_id,
+            feature_name=feature_name,
+            persona_names=persona_names,
+            image_uploaded=image_uploaded,
+            openai_called=True,
+            openai_succeeded=False,
+            used_openai=False,
+            fallback_reason=fallback_reason,
+            openai_attempts=openai_attempts,
+            openai_response_id=openai_response_id,
+            post_processing_warning=None,
+        )
+        _update_simulation_job(
+            job_id,
+            status="failed",
+            error=fallback_reason,
+            result=None,
+        )
+        logger.exception(
+            "simulation_job_failed jobId=%s requestId=%s timestamp=%s "
+            "durationMs=%s error=%r",
+            job_id,
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            fallback_reason,
+        )
+
+
+def _update_simulation_job(
+    job_id: str,
+    status: str,
+    error: str | None,
+    result: SimulationResultResponse | None,
+) -> None:
+    now = _utc_timestamp()
+    now_epoch = time.time()
+    with SIMULATION_JOBS_LOCK:
+        job = SIMULATION_JOBS.get(job_id)
+        if job is None:
+            return
+        job.update(
+            {
+                "status": status,
+                "updatedAt": now,
+                "updatedAtEpoch": now_epoch,
+                "error": error,
+                "result": result,
+            }
+        )
+
+
+def _simulation_job_response(job: dict) -> SimulationJobStatusResponse:
+    return SimulationJobStatusResponse(
+        jobId=job["jobId"],
+        status=job["status"],
+        createdAt=job["createdAt"],
+        updatedAt=job["updatedAt"],
+        requestId=job["requestId"],
+        error=job.get("error"),
+        result=job.get("result"),
+    )
+
+
+def _cleanup_simulation_jobs_locked(now_epoch: float) -> None:
+    expired_job_ids = [
+        job_id
+        for job_id, job in SIMULATION_JOBS.items()
+        if now_epoch - float(job.get("updatedAtEpoch", 0)) > SIMULATION_JOB_TTL_SECONDS
+    ]
+    for job_id in expired_job_ids:
+        SIMULATION_JOBS.pop(job_id, None)
+
+    if len(SIMULATION_JOBS) <= SIMULATION_JOB_LIMIT:
+        return
+
+    removable = sorted(
+        (
+            (job_id, job)
+            for job_id, job in SIMULATION_JOBS.items()
+            if job.get("status") in {"completed", "failed"}
+        ),
+        key=lambda item: float(item[1].get("createdAtEpoch", 0)),
+    )
+    for job_id, _job in removable[: len(SIMULATION_JOBS) - SIMULATION_JOB_LIMIT]:
+        SIMULATION_JOBS.pop(job_id, None)
 
 
 def _parse_personas(personas_json: str, request_id: str) -> list[GeneratedPersona]:

@@ -1907,7 +1907,7 @@ function PersonaSelectionStep({
               className="focus-ring inline-flex items-center gap-2 rounded-lg bg-bnz-700 px-5 py-2 text-sm font-bold text-white shadow-sm hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {simulating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-              Continue to Simulation
+              {simulating ? "Simulation running" : "Continue to Simulation"}
             </button>
           </div>
         </div>
@@ -2166,7 +2166,7 @@ function AutoGeneratePersonaStep({
               className="focus-ring inline-flex items-center gap-2 rounded-lg bg-bnz-700 px-5 py-2 text-sm font-bold text-white shadow-sm hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {simulating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-              Continue to Simulation
+              {simulating ? "Simulation running" : "Continue to Simulation"}
             </button>
           </div>
         </div>

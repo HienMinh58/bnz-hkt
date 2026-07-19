@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 OverallDecision = Literal["Launch", "Revise before release", "Do not launch"]
 OverallImpact = Literal["Negative", "Neutral", "Positive"]
+SimulationJobStatus = Literal["queued", "running", "completed", "failed"]
 
 
 class StrictBaseModel(BaseModel):
@@ -239,6 +240,22 @@ class SimulationResultResponse(StrictBaseModel):
     developmentDebug: DevelopmentDebug | None = None
     used_openai: bool
     fallback_reason: str | None
+
+
+class SimulationJobCreateResponse(StrictBaseModel):
+    jobId: str
+    status: SimulationJobStatus
+    requestId: str
+
+
+class SimulationJobStatusResponse(StrictBaseModel):
+    jobId: str
+    status: SimulationJobStatus
+    createdAt: str
+    updatedAt: str
+    requestId: str
+    error: str | None = None
+    result: SimulationResultResponse | None = None
 
 
 class AdvisorChatMessage(StrictBaseModel):
