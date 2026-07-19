@@ -28,7 +28,6 @@ import ForceGraph2D, {
 import {
   analyzeAd,
   askSimulationAdvisor,
-  generateAudienceFit,
   generatePersonas,
   runSimulation,
 } from "../api/client";
@@ -535,6 +534,10 @@ type AdAnalysisPreview = {
   ambiguity: string[];
   hypothesis: string;
   expectedAction: string;
+  segments?: AudienceFitResponse["segments"];
+  primarySegment?: string | null;
+  profileCount?: number | null;
+  segmentationServiceUrl?: string | null;
   usedOpenAI?: boolean;
   fallbackReason?: string | null;
 };
@@ -647,6 +650,10 @@ function fromAdAnalysisResponse(response: AdAnalysisResponse): AdAnalysisPreview
     ambiguity: response.ambiguity,
     hypothesis: response.audienceHypothesis,
     expectedAction: response.expectedCustomerAction,
+    segments: response.segments,
+    primarySegment: response.primarySegment,
+    profileCount: response.profileCount,
+    segmentationServiceUrl: response.segmentationServiceUrl,
     usedOpenAI: response.used_openai,
     fallbackReason: response.fallback_reason,
   };
@@ -2797,7 +2804,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("input");
   const [inputsChanged, setInputsChanged] = useState(false);
   const [analyzingAd, setAnalyzingAd] = useState(false);
-  const [generatingAudienceFit, setGeneratingAudienceFit] = useState(false);
   const [audienceFit, setAudienceFit] = useState<AudienceFitResponse | null>(null);
   const [serverAdAnalysis, setServerAdAnalysis] = useState<AdAnalysisPreview | null>(null);
   const [generating, setGenerating] = useState(false);
@@ -2859,7 +2865,27 @@ export default function App() {
       });
       const preview = fromAdAnalysisResponse(response);
       setServerAdAnalysis(preview);
-      setAudienceFit(null);
+      setAudienceFit(
+        response.segments?.length
+          ? {
+              segments: response.segments,
+              profileCount: response.profileCount ?? response.segments.reduce(
+                (total, segment) => total + segment.count,
+                0,
+              ),
+              primarySegment: response.primarySegment ?? response.segments[0]?.segment_name ?? null,
+              segmentationServiceUrl: response.segmentationServiceUrl ?? "",
+              used_openai: response.used_openai,
+              fallback_reason: response.fallback_reason,
+              requestId: response.requestId,
+              durationMs: response.durationMs,
+              openaiResponseId: response.openaiResponseId,
+              openaiAttempts: response.openaiAttempts,
+              openaiAttemptResponseIds: response.openaiAttemptResponseIds,
+              openaiDurationMs: response.openaiDurationMs,
+            }
+          : null,
+      );
       setForm((current) => ({
         ...current,
         targetCustomerSegment: preview.hypothesis,
@@ -2900,42 +2926,6 @@ export default function App() {
       );
     } finally {
       setAnalyzingAd(false);
-    }
-  }
-
-  async function onGenerateAudienceFit() {
-    if (!form.featureName.trim()) {
-      setError("Campaign name is required before segment fit generation");
-      return;
-    }
-    if (!form.customerFacingCopy.trim()) {
-      setError("Advertisement copy or campaign brief is required before segment fit generation");
-      return;
-    }
-    const hypothesis = form.targetCustomerSegment.trim() || adAnalysis.hypothesis;
-    if (!hypothesis.trim()) {
-      setError("Audience hypothesis is required before segment fit generation");
-      return;
-    }
-    setGeneratingAudienceFit(true);
-    setError(null);
-    try {
-      const response = await generateAudienceFit({
-        campaignName: form.featureName,
-        advertisementCopy: form.customerFacingCopy,
-        channel: form.channel,
-        placement: form.shownTiming,
-        campaignContext: form.featureDescription,
-        audienceHypothesis: hypothesis,
-        audienceCues: adAnalysis.audienceCues,
-        behaviorSignals: adAnalysis.behaviorSignals,
-        profileCount: form.personaCount,
-      });
-      setAudienceFit(response);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Audience fit failed");
-    } finally {
-      setGeneratingAudienceFit(false);
     }
   }
 
@@ -3186,7 +3176,7 @@ export default function App() {
                 ) : (
                   <BrainCircuit className="h-4 w-4" />
                 )}
-                {analyzingAd ? "Analyzing with OpenAI" : "Analyze ad"}
+                {analyzingAd ? "Generating segment-backed analysis" : "Analyze ad"}
               </button>
               </section>
 
@@ -3198,7 +3188,7 @@ export default function App() {
                         Ad analysis
                       </h3>
                       <p className="mt-1 text-xs leading-5 text-slate-500">
-                        Preview of the audience assumptions used in the next step.
+                        Segment-backed expected customers and behavior used in the next step.
                       </p>
                     </div>
                     <div className="flex flex-col items-end gap-2">
@@ -3272,22 +3262,9 @@ export default function App() {
                         Estimated segment fit
                       </h3>
                       <p className="mt-1 text-xs leading-5 text-slate-500">
-                        Generates synthetic banking feature profiles, then calls the segmentation service.
+                        Created from synthetic banking feature profiles classified by the segmentation service.
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      disabled={generatingAudienceFit || analyzingAd}
-                      onClick={() => void onGenerateAudienceFit()}
-                      className="focus-ring inline-flex items-center justify-center gap-2 rounded-lg border border-bnz-200 bg-bnz-50 px-3 py-2 text-xs font-bold text-bnz-700 transition hover:bg-bnz-100 disabled:cursor-not-allowed disabled:opacity-70"
-                    >
-                      {generatingAudienceFit ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Network className="h-4 w-4" />
-                      )}
-                      {generatingAudienceFit ? "Generating" : "Generate fit"}
-                    </button>
                   </div>
 
                   {audienceFit ? (
@@ -3321,7 +3298,7 @@ export default function App() {
                     </div>
                   ) : (
                     <div className="mt-4 rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-500">
-                      Generate fit after the ad analysis looks right. Percentages appear after synthetic profiles are classified by the segmentation service.
+                      Run ad analysis to generate feature profiles and classify expected customer segments.
                     </div>
                   )}
                 </section>

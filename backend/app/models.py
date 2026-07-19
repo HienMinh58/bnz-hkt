@@ -60,6 +60,14 @@ class GeneratePersonasResponse(StrictBaseModel):
     durationMs: int | None = None
 
 
+class SegmentFitSummary(StrictBaseModel):
+    segment_id: int
+    segment_name: str
+    count: int
+    percentage: float
+    average_confidence: float
+
+
 class AdAnalysisRequest(StrictBaseModel):
     campaignName: str
     advertisementCopy: str
@@ -77,6 +85,10 @@ class AdAnalysisResponse(StrictBaseModel):
     ambiguity: list[str]
     audienceHypothesis: str
     expectedCustomerAction: str
+    segments: list[SegmentFitSummary] = Field(default_factory=list)
+    primarySegment: str | None = None
+    profileCount: int | None = None
+    segmentationServiceUrl: str | None = None
     used_openai: bool
     fallback_reason: str | None
     requestId: str | None = None
@@ -124,14 +136,6 @@ class AudienceFitRequest(StrictBaseModel):
     audienceCues: list[str]
     behaviorSignals: list[str]
     profileCount: int = Field(ge=1, le=100)
-
-
-class SegmentFitSummary(StrictBaseModel):
-    segment_id: int
-    segment_name: str
-    count: int
-    percentage: float
-    average_confidence: float
 
 
 class AudienceFitResponse(StrictBaseModel):

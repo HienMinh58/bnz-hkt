@@ -15,7 +15,7 @@ import type {
 } from "../types/simulation";
 import { supabase } from "./supabaseClient";
 
-const ANALYZE_AD_TIMEOUT_MS = 120_000;
+const ANALYZE_AD_TIMEOUT_MS = 240_000;
 const AUDIENCE_FIT_TIMEOUT_MS = 240_000;
 const GENERATE_PERSONAS_TIMEOUT_MS = 330_000;
 const RUN_SIMULATION_TIMEOUT_MS = 330_000;

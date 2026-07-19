@@ -493,6 +493,97 @@ Requirements:
     )
 
 
+def derive_ad_analysis_from_segments_with_openai(
+    campaign_name: str,
+    advertisement_copy: str,
+    channel: str,
+    placement: str,
+    campaign_context: str,
+    segments: list[dict],
+    profile_count: int,
+    segmentation_service_url: str,
+    request_id: str | None = None,
+) -> AdAnalysisResponse:
+    prompt = f"""
+Derive a segment-backed audience analysis for this banking advertisement.
+Return valid JSON only.
+
+Campaign name: {campaign_name}
+Advertisement copy or campaign brief: {advertisement_copy}
+Channel: {channel}
+Placement / trigger point: {placement}
+Optional campaign context: {campaign_context}
+
+Segmentation service result summary:
+{json.dumps(segments, indent=2)}
+
+Requirements:
+- Treat the segment summary as the primary evidence for expected customers and
+  behavior signals.
+- Use the ad text to identify the product, offer, intent, and expected action.
+- Do not claim these are real customers or a real prediction.
+- Keep wording plain and useful for a product team.
+- productType should name the banking product or "General banking campaign".
+- offerAngle should describe the main value proposition.
+- likelyIntent should be one of: Awareness, Consideration, Conversion, Upsell, Retention.
+- audienceCues should contain 2-5 segment-backed customer descriptors.
+- behaviorSignals should contain 2-5 financial or channel behaviours implied by
+  the segment fit and generated feature profiles.
+- ambiguity should list unclear assumptions, missing targeting information, or
+  mismatches between the ad and the segment fit.
+- audienceHypothesis should be one clear sentence describing the likely expected
+  customers, grounded in the segment distribution.
+- expectedCustomerAction should describe what the ad asks the customer to do next.
+- segments must exactly match the segment summary provided.
+- primarySegment must be the highest-percentage segment name, or null if none.
+- profileCount must be {profile_count}.
+- segmentationServiceUrl must be "{segmentation_service_url}".
+- used_openai must be true.
+- fallback_reason must be null.
+"""
+    openai_result = _responses_create_with_retry(
+        request_id=request_id,
+        endpoint="derive-ad-analysis-from-segments",
+        persona_count=profile_count,
+        image_uploaded=False,
+        model=_model(),
+        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "ad_analysis_response",
+                "schema": _schema_for(AdAnalysisResponse),
+                "strict": True,
+            }
+        },
+    )
+    try:
+        parsed = AdAnalysisResponse.model_validate_json(openai_result.response.output_text)
+    except Exception as exc:
+        setattr(exc, "attempts", openai_result.attempts)
+        setattr(exc, "openai_response_ids", openai_result.response_ids)
+        setattr(exc, "openai_response_id", getattr(openai_result.response, "id", None))
+        setattr(exc, "openai_duration_ms", openai_result.duration_ms)
+        raise
+    return parsed.model_copy(
+        update={
+            "segments": [
+                item if isinstance(item, dict) else item.model_dump()
+                for item in segments
+            ],
+            "primarySegment": segments[0]["segment_name"] if segments else None,
+            "profileCount": profile_count,
+            "segmentationServiceUrl": segmentation_service_url,
+            "used_openai": True,
+            "fallback_reason": None,
+            "openaiResponseId": getattr(openai_result.response, "id", None),
+            "openaiAttempts": openai_result.attempts,
+            "openaiAttemptResponseIds": openai_result.response_ids,
+            "openaiDurationMs": openai_result.duration_ms,
+        }
+    )
+
+
 def generate_synthetic_feature_profiles_with_openai(
     campaign_name: str,
     advertisement_copy: str,

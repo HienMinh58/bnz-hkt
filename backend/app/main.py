@@ -32,8 +32,8 @@ from app.models import (
     SimulationResultResponse,
 )
 from app.openai_client import (
-    analyze_ad_with_openai,
     advise_on_simulation_with_openai,
+    derive_ad_analysis_from_segments_with_openai,
     generate_synthetic_feature_profiles_with_openai,
     generate_personas_with_openai,
     simulate_with_openai,
@@ -50,6 +50,7 @@ SIMULATION_JOBS: dict[str, dict] = {}
 SIMULATION_JOBS_LOCK = RLock()
 SIMULATION_JOB_TTL_SECONDS = 60 * 60
 SIMULATION_JOB_LIMIT = 100
+AD_ANALYSIS_PROFILE_COUNT = 6
 
 
 def _cors_origins_from_env() -> list[str]:
@@ -89,45 +90,90 @@ def analyze_ad(
 ) -> AdAnalysisResponse:
     request_id = uuid4().hex
     endpoint_started_at = time.perf_counter()
+    segmentation_url = _segmentation_service_url()
     logger.info(
-        "analyze_ad_request_received requestId=%s timestamp=%s campaignName=%r",
+        "analyze_ad_request_received requestId=%s timestamp=%s campaignName=%r "
+        "segmentationUrl=%s",
         request_id,
         _utc_timestamp(),
         request.campaignName,
+        segmentation_url,
     )
 
     openai_started_at: float | None = None
     try:
         openai_started_at = time.perf_counter()
         logger.info(
-            "analyze_ad_openai_start requestId=%s timestamp=%s",
+            "analyze_ad_feature_profiles_start requestId=%s timestamp=%s",
             request_id,
             _utc_timestamp(),
         )
-        result = analyze_ad_with_openai(
+        profiles_result, profiles_openai_result = generate_synthetic_feature_profiles_with_openai(
             campaign_name=request.campaignName,
             advertisement_copy=request.advertisementCopy,
             channel=request.channel,
             placement=request.placement,
             campaign_context=request.campaignContext,
+            audience_hypothesis=(
+                "No audience hypothesis yet. Generate plausible bank-owned "
+                "feature records from the ad input so the segmentation service "
+                "can identify expected customer segments first."
+            ),
+            audience_cues=[],
+            behavior_signals=[],
+            profile_count=AD_ANALYSIS_PROFILE_COUNT,
+            request_id=request_id,
+        )
+        profiles = [_normalize_feature_record(profile) for profile in profiles_result.profiles]
+        segment_results = _segment_profiles(segmentation_url, profiles)
+        segments = _aggregate_segment_results(segment_results)
+        segment_dicts = [segment.model_dump() for segment in segments]
+        logger.info(
+            "analyze_ad_segmentation_complete requestId=%s timestamp=%s "
+            "profileCount=%s primarySegment=%r",
+            request_id,
+            _utc_timestamp(),
+            len(profiles),
+            segments[0].segment_name if segments else None,
+        )
+        result = derive_ad_analysis_from_segments_with_openai(
+            campaign_name=request.campaignName,
+            advertisement_copy=request.advertisementCopy,
+            channel=request.channel,
+            placement=request.placement,
+            campaign_context=request.campaignContext,
+            segments=segment_dicts,
+            profile_count=len(profiles),
+            segmentation_service_url=segmentation_url,
             request_id=request_id,
         )
         duration_ms = _duration_ms(endpoint_started_at)
-        openai_duration_ms = result.openaiDurationMs or _duration_ms(openai_started_at)
+        openai_duration_ms = (
+            (profiles_openai_result.duration_ms or 0)
+            + (result.openaiDurationMs or 0)
+        )
+        openai_attempts = profiles_openai_result.attempts + (result.openaiAttempts or 0)
+        openai_response_ids = [
+            *profiles_openai_result.response_ids,
+            *(result.openaiAttemptResponseIds or []),
+        ]
         logger.info(
             "analyze_ad_response_returned requestId=%s timestamp=%s durationMs=%s "
-            "openaiDurationMs=%s success=True used_openai=%s",
+            "openaiDurationMs=%s success=True used_openai=%s primarySegment=%r",
             request_id,
             _utc_timestamp(),
             duration_ms,
             openai_duration_ms,
             result.used_openai,
+            result.primarySegment,
         )
         return result.model_copy(
             update={
                 "requestId": request_id,
                 "durationMs": duration_ms,
                 "openaiDurationMs": openai_duration_ms,
+                "openaiAttempts": openai_attempts,
+                "openaiAttemptResponseIds": openai_response_ids,
             }
         )
     except Exception as exc:

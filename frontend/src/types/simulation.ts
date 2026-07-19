@@ -48,6 +48,10 @@ export interface AdAnalysisResponse {
   ambiguity: string[];
   audienceHypothesis: string;
   expectedCustomerAction: string;
+  segments?: SegmentFitSummary[];
+  primarySegment?: string | null;
+  profileCount?: number | null;
+  segmentationServiceUrl?: string | null;
   used_openai: boolean;
   fallback_reason: string | null;
   requestId?: string | null;
