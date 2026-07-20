@@ -12,6 +12,7 @@ import {
   BadgeCheck,
   BrainCircuit,
   CheckCircle2,
+  CircleHelp,
   ImageUp,
   Loader2,
   Network,
@@ -40,6 +41,7 @@ import type {
   GeneratedPersona,
   Persona,
   PersonaSimulationResult,
+  SimulationJobStatusResponse,
   SimulationResponse,
 } from "../types/simulation";
 
@@ -462,6 +464,625 @@ function ScoreCard({
         )}
       </div>
       {detail ? <p className="mt-2 text-sm text-slate-500">{detail}</p> : null}
+    </div>
+  );
+}
+
+function formatLoss(value: number | null | undefined) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "N/A";
+  return `${Math.round(value * 100)}%`;
+}
+
+function lossLevel(value: number | null | undefined) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "Unknown";
+  if (value < 0.25) return "Low";
+  if (value < 0.45) return "Medium";
+  return "High";
+}
+
+function lossClass(value: number | null | undefined) {
+  const level = lossLevel(value);
+  if (level === "Low") return "text-emerald-700";
+  if (level === "Medium") return "text-amber-700";
+  if (level === "High") return "text-rose-700";
+  return "text-slate-500";
+}
+
+type LaunchLossChartBatch = {
+  batchIndex: number;
+  personaStart: number;
+  personaEnd: number;
+  launchLoss?: number | null;
+  status?: string | null;
+  overallDecision?: string | null;
+  error?: string | null;
+};
+
+type RevisionHistoryItem = {
+  id: string;
+  label: string;
+  message: string;
+  launchLoss: number | null;
+  overallDecision: string;
+  status: "accepted" | "candidate" | "rejected";
+  reason: string;
+  result: SimulationResponse;
+};
+
+const MIN_REVISION_IMPROVEMENT = 0.03;
+const TARGET_LAUNCH_LOSS = 0.25;
+const MAX_REVISION_ROUNDS = 3;
+
+function decisionRank(decision: string) {
+  if (decision === "Do not launch") return 2;
+  if (decision === "Revise before release") return 1;
+  return 0;
+}
+
+function keyRiskIncrease(
+  current: SimulationResponse,
+  candidate: SimulationResponse,
+) {
+  return Math.max(
+    candidate.privacyRisk - current.privacyRisk,
+    candidate.fairnessRisk - current.fairnessRisk,
+    candidate.accessibilityRisk - current.accessibilityRisk,
+  );
+}
+
+function lossFill(value: number | null | undefined) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "#cbd5e1";
+  if (value < 0.25) return "#10b981";
+  if (value < 0.45) return "#f59e0b";
+  return "#ef4444";
+}
+
+function LaunchLossBatchChart({
+  batches,
+  title,
+  xLabel = "Batch",
+  pointPrefix = "B",
+}: {
+  batches: LaunchLossChartBatch[];
+  title: string;
+  xLabel?: string;
+  pointPrefix?: string;
+}) {
+  if (!batches.length) return null;
+
+  const width = 720;
+  const height = 240;
+  const left = 58;
+  const right = 22;
+  const top = 22;
+  const bottom = 54;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const xFor = (index: number) =>
+    batches.length === 1
+      ? left + plotWidth / 2
+      : left + (plotWidth * index) / (batches.length - 1);
+  const yFor = (value: number) => top + plotHeight - value * plotHeight;
+  const completedPoints = batches
+    .map((batch, index) => ({ batch, index }))
+    .filter(({ batch }) => typeof batch.launchLoss === "number")
+    .map(({ batch, index }) => ({
+      batch,
+      x: xFor(index),
+      y: yFor(batch.launchLoss ?? 0),
+    }));
+  const linePath = completedPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
+    .join(" ");
+  const first = completedPoints[0]?.batch.launchLoss;
+  const last = completedPoints[completedPoints.length - 1]?.batch.launchLoss;
+  const delta =
+    typeof first === "number" && typeof last === "number" && completedPoints.length > 1
+      ? last - first
+      : null;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-4">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-sm font-bold text-slate-800">{title}</div>
+        {delta !== null ? (
+          <div className={`text-xs font-bold ${delta <= 0 ? "text-emerald-700" : "text-rose-700"}`}>
+            {delta <= 0 ? "Improved" : "Worse"} {formatLoss(Math.abs(delta))} from first completed batch
+          </div>
+        ) : null}
+      </div>
+      <div className="mt-3 overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          className="min-w-[620px] text-slate-500"
+          role="img"
+          aria-label={title}
+        >
+          {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+            const y = yFor(tick);
+            return (
+              <g key={tick}>
+                <line
+                  x1={left}
+                  y1={y}
+                  x2={width - right}
+                  y2={y}
+                  stroke="#e2e8f0"
+                  strokeWidth="1"
+                />
+                <text
+                  x={left - 12}
+                  y={y + 4}
+                  textAnchor="end"
+                  className="fill-slate-500 text-[11px] font-semibold"
+                >
+                  {Math.round(tick * 100)}%
+                </text>
+              </g>
+            );
+          })}
+          <line
+            x1={left}
+            y1={top + plotHeight}
+            x2={width - right}
+            y2={top + plotHeight}
+            stroke="#94a3b8"
+            strokeWidth="1.5"
+          />
+          <line
+            x1={left}
+            y1={top}
+            x2={left}
+            y2={top + plotHeight}
+            stroke="#94a3b8"
+            strokeWidth="1.5"
+          />
+          {linePath ? (
+            <path
+              d={linePath}
+              fill="none"
+              stroke="#123d73"
+              strokeWidth="3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          ) : null}
+          {batches.map((batch, index) => {
+            const hasLoss = typeof batch.launchLoss === "number";
+            const x = xFor(index);
+            const y = hasLoss ? yFor(batch.launchLoss ?? 0) : top + plotHeight;
+            const isRunning = batch.status === "running";
+            const isFailed = batch.status === "failed";
+            const fill = isFailed ? "#dc2626" : isRunning ? "#123d73" : lossFill(batch.launchLoss);
+            const label =
+              hasLoss
+                ? `${formatLoss(batch.launchLoss)}${batch.overallDecision ? `, ${batch.overallDecision}` : ""}`
+                : batch.status ?? "queued";
+            return (
+              <g key={batch.batchIndex}>
+                <line
+                  x1={x}
+                  y1={top + plotHeight}
+                  x2={x}
+                  y2={top + plotHeight + 5}
+                  stroke="#94a3b8"
+                  strokeWidth="1.5"
+                />
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={isRunning ? 8 : 7}
+                  fill={fill}
+                  stroke="#ffffff"
+                  strokeWidth="3"
+                >
+                  <title>
+                    {`Batch ${batch.batchIndex}, personas ${batch.personaStart}-${batch.personaEnd}: ${label}`}
+                  </title>
+                </circle>
+                {isRunning ? (
+                  <circle
+                    cx={x}
+                    cy={y}
+                    r="13"
+                    fill="none"
+                    stroke="#123d73"
+                    strokeOpacity="0.28"
+                    strokeWidth="3"
+                  />
+                ) : null}
+                {hasLoss ? (
+                  <text
+                    x={x}
+                    y={y - 13}
+                    textAnchor="middle"
+                    className="fill-slate-800 text-[11px] font-bold"
+                  >
+                    {formatLoss(batch.launchLoss)}
+                  </text>
+                ) : null}
+                <text
+                  x={x}
+                  y={top + plotHeight + 24}
+                  textAnchor="middle"
+                  className="fill-slate-700 text-[11px] font-bold"
+                >
+                  {pointPrefix}{batch.batchIndex}
+                </text>
+                <text
+                  x={x}
+                  y={top + plotHeight + 40}
+                  textAnchor="middle"
+                  className="fill-slate-500 text-[10px] font-semibold"
+                >
+                  {batch.personaStart}-{batch.personaEnd}
+                </text>
+              </g>
+            );
+          })}
+          <text
+            x={left + plotWidth / 2}
+            y={height - 4}
+            textAnchor="middle"
+            className="fill-slate-500 text-[11px] font-bold"
+          >
+            {xLabel}
+          </text>
+          <text
+            x={18}
+            y={top + plotHeight / 2}
+            textAnchor="middle"
+            transform={`rotate(-90 18 ${top + plotHeight / 2})`}
+            className="fill-slate-500 text-[11px] font-bold"
+          >
+            Launch loss
+          </text>
+        </svg>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-3 text-xs font-semibold text-slate-500">
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" /> Low
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2.5 w-2.5 rounded-full bg-amber-500" /> Medium
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2.5 w-2.5 rounded-full bg-rose-500" /> High
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="h-2.5 w-2.5 rounded-full bg-bnz-700" /> Running
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function LaunchLossHelp() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="What is launch loss?"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="focus-ring inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-600 shadow-sm hover:bg-bnz-50 hover:text-bnz-700"
+      >
+        <CircleHelp className="h-4 w-4" />
+      </button>
+      {open ? (
+        <div
+          role="note"
+          className="absolute left-0 z-20 mt-2 w-[min(22rem,calc(100vw-3rem))] rounded-lg border border-slate-200 bg-white p-4 text-sm leading-6 text-slate-700 shadow-xl"
+        >
+          <div className="font-bold text-slate-950">What is launch loss?</div>
+          <p className="mt-2">
+            Launch loss estimates how risky it is to launch this campaign as-is.
+            Lower is better.
+          </p>
+          <div className="mt-3 grid gap-2 text-xs font-semibold text-slate-600">
+            <div>0-25%: Low risk</div>
+            <div>25-45%: Medium risk</div>
+            <div>45%+: High risk</div>
+          </div>
+          <p className="mt-3">
+            It combines clarity loss, trust loss, stress, fairness,
+            accessibility, privacy, operational, and financial wellbeing risk.
+          </p>
+          <p className="mt-3 text-xs font-semibold text-slate-500">
+            Batch trend shows which persona batch increased or reduced risk.
+          </p>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            className="focus-ring mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-white"
+          >
+            Close
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function LaunchLossPanel({ result }: { result: SimulationResponse }) {
+  if (typeof result.launchLoss !== "number") return null;
+
+  const breakdown = Object.entries(result.launchLossBreakdown ?? {})
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 4);
+  const batchLosses = result.batchLaunchLosses ?? [];
+  const firstBatch = batchLosses[0]?.launchLoss;
+  const lastBatch = batchLosses[batchLosses.length - 1]?.launchLoss;
+  const delta =
+    typeof firstBatch === "number" && typeof lastBatch === "number"
+      ? lastBatch - firstBatch
+      : null;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <AlertTriangle className={`h-5 w-5 ${lossClass(result.launchLoss)}`} />
+            <h2 className="text-lg font-bold text-slate-950">Launch loss</h2>
+            <LaunchLossHelp />
+            <Badge value={lossLevel(result.launchLoss)} />
+          </div>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+            Weighted risk objective from clarity, trust, stress, fairness,
+            accessibility, privacy, operational, and financial wellbeing signals.
+          </p>
+        </div>
+        <div className="text-left lg:text-right">
+          <div className={`text-4xl font-black ${lossClass(result.launchLoss)}`}>
+            {formatLoss(result.launchLoss)}
+          </div>
+          {delta !== null && batchLosses.length > 1 ? (
+            <div className="mt-1 text-sm font-semibold text-slate-500">
+              {delta <= 0 ? "Down" : "Up"} {formatLoss(Math.abs(delta))} from batch 1
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      {breakdown.length ? (
+        <div className="mt-5 grid gap-3 md:grid-cols-4">
+          {breakdown.map(([label, value]) => (
+            <div key={label} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                {label.replace(/([A-Z])/g, " $1")}
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className="h-full rounded-full bg-bnz-600"
+                  style={{ width: `${Math.max(4, Math.round(value * 100))}%` }}
+                />
+              </div>
+              <div className="mt-2 text-sm font-bold text-slate-900">
+                {formatLoss(value)}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {batchLosses.length ? (
+        <div className="mt-5">
+          <LaunchLossBatchChart batches={batchLosses} title="Batch trend" />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MessageOptimizerPanel({
+  result,
+  revisionHistory,
+  optimizing,
+  autoAccept,
+  onAutoAcceptChange,
+  onEvaluateBetterMessage,
+  onAcceptRevision,
+  simulationProgress,
+}: {
+  result: SimulationResponse;
+  revisionHistory: RevisionHistoryItem[];
+  optimizing: boolean;
+  autoAccept: boolean;
+  onAutoAcceptChange: (value: boolean) => void;
+  onEvaluateBetterMessage: () => void;
+  onAcceptRevision: (item: RevisionHistoryItem) => void;
+  simulationProgress: SimulationJobStatusResponse | null;
+}) {
+  const acceptedRounds = revisionHistory.filter((item) => item.status === "accepted").length;
+  const currentLoss = result.launchLoss ?? null;
+  const stopReasons = [
+    currentLoss !== null && currentLoss <= TARGET_LAUNCH_LOSS
+      ? "Target launch loss reached."
+      : null,
+    acceptedRounds > MAX_REVISION_ROUNDS
+      ? "Maximum revision rounds reached."
+      : null,
+    !result.betterMessage.trim() ? "No revised message candidate is available." : null,
+  ].filter(Boolean);
+  const canEvaluate = !optimizing && !stopReasons.length;
+  const latestCandidate = [...revisionHistory]
+    .reverse()
+    .find((item) => item.status === "candidate");
+
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold text-bnz-700">
+            <Sparkles className="h-4 w-4" />
+            Message optimizer
+          </div>
+          <h2 className="mt-2 text-lg font-bold text-slate-950">
+            Loss-guided revision loop
+          </h2>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+            Evaluate the suggested better message on the same persona set, then
+            accept it only when launch loss improves enough and key risks do not
+            worsen.
+          </p>
+        </div>
+        <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700">
+          <input
+            type="checkbox"
+            checked={autoAccept}
+            onChange={(event) => onAutoAcceptChange(event.target.checked)}
+            className="h-4 w-4 rounded border-slate-300 text-bnz-700 focus:ring-bnz-500"
+          />
+          Auto-accept improved revisions
+        </label>
+      </div>
+
+      <div className="mt-4 grid gap-3 md:grid-cols-4">
+        <ScoreCard
+          label="Current loss"
+          value={formatLoss(currentLoss)}
+          detail="Measured on the fixed persona set."
+        />
+        <ScoreCard
+          label="Target"
+          value={formatLoss(TARGET_LAUNCH_LOSS)}
+          detail="Stop when loss is low enough."
+        />
+        <ScoreCard
+          label="Min improvement"
+          value={formatLoss(MIN_REVISION_IMPROVEMENT)}
+          detail="Reject tiny/noisy gains."
+        />
+        <ScoreCard
+          label="Max rounds"
+          value={`${MAX_REVISION_ROUNDS}`}
+          detail="Controls cost and drift."
+        />
+      </div>
+
+      {stopReasons.length ? (
+        <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm font-semibold text-amber-800">
+          {stopReasons[0]}
+        </div>
+      ) : null}
+
+      <div className="mt-4 flex flex-wrap gap-3">
+        <button
+          type="button"
+          disabled={!canEvaluate}
+          onClick={onEvaluateBetterMessage}
+          className="focus-ring inline-flex items-center gap-2 rounded-lg bg-bnz-700 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {optimizing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+          {optimizing ? "Evaluating revision" : "Evaluate better message"}
+        </button>
+        {latestCandidate ? (
+          <button
+            type="button"
+            onClick={() => onAcceptRevision(latestCandidate)}
+            className="focus-ring rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-bold text-emerald-700 hover:bg-white"
+          >
+            Accept latest candidate
+          </button>
+        ) : null}
+      </div>
+
+      {optimizing && simulationProgress ? (
+        <div className="mt-5">
+          <SimulationBatchProgressPanel progress={simulationProgress} />
+        </div>
+      ) : null}
+
+      {revisionHistory.length ? (
+        <div className="mt-5">
+          <LaunchLossBatchChart
+            title="Revision loss trend"
+            xLabel="Revision"
+            pointPrefix="R"
+            batches={revisionHistory.map((item, index) => ({
+              batchIndex: index + 1,
+              personaStart: index + 1,
+              personaEnd: index + 1,
+              launchLoss: item.launchLoss,
+              status: item.status === "accepted" ? "completed" : item.status,
+              overallDecision: item.overallDecision,
+            }))}
+          />
+          <div className="mt-4 grid gap-3">
+            {revisionHistory.map((item) => (
+              <div
+                key={item.id}
+                className="rounded-lg border border-slate-200 bg-slate-50 p-4"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-bold text-slate-950">
+                      {item.label}
+                    </div>
+                    <div className="mt-1 text-xs font-semibold text-slate-500">
+                      {item.reason}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Badge value={item.status} />
+                    <Badge value={formatLoss(item.launchLoss)} />
+                    <Badge value={item.overallDecision} />
+                  </div>
+                </div>
+                <p className="mt-3 rounded-lg border border-slate-200 bg-white p-3 text-sm leading-6 text-slate-700">
+                  {item.message}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function SimulationBatchProgressPanel({
+  progress,
+}: {
+  progress: SimulationJobStatusResponse | null;
+}) {
+  const batches = progress?.batchProgress ?? [];
+  if (!progress || !batches.length) return null;
+
+  const completed = progress.completedBatches ?? batches.filter((batch) => batch.status === "completed").length;
+  const total = progress.totalBatches ?? batches.length;
+
+  return (
+    <div className="rounded-lg border border-bnz-100 bg-bnz-50 p-4">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            {progress.status === "failed" ? (
+              <AlertTriangle className="h-5 w-5 text-rose-600" />
+            ) : (
+              <Loader2 className="h-5 w-5 animate-spin text-bnz-700" />
+            )}
+            <div className="text-sm font-bold text-slate-950">
+              Simulation batches
+            </div>
+          </div>
+          <div className="mt-1 text-xs font-semibold text-slate-600">
+            {progress.status === "completed"
+              ? "Completed"
+              : progress.status === "failed"
+                ? "Failed"
+                : `Running batch ${progress.currentBatch ?? completed + 1} of ${total}`}
+          </div>
+        </div>
+        <Badge value={`${completed}/${total} completed`} />
+      </div>
+
+      <div className="mt-4">
+        <LaunchLossBatchChart batches={batches} title="Launch loss by batch" />
+      </div>
     </div>
   );
 }
@@ -1786,6 +2407,7 @@ function PersonaSelectionStep({
   onAddCustomPersona,
   onContinue,
   simulating,
+  simulationProgress,
 }: {
   targetCount: number;
   selectedPersonas: Persona[];
@@ -1794,6 +2416,7 @@ function PersonaSelectionStep({
   onAddCustomPersona: (persona: Persona) => void;
   onContinue: () => void;
   simulating: boolean;
+  simulationProgress: SimulationJobStatusResponse | null;
 }) {
   const [activeTag, setActiveTag] = useState<string>("All");
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
@@ -1937,6 +2560,8 @@ function PersonaSelectionStep({
         </div>
       </div>
 
+      <SimulationBatchProgressPanel progress={simulationProgress} />
+
       {customOpen ? (
         <CustomPersonaForm
           persona={customPersona}
@@ -2072,6 +2697,7 @@ function AutoGeneratePersonaStep({
   onRemovePersona,
   onAddCustomPersona,
   onContinue,
+  simulationProgress,
 }: {
   form: FeatureTestInput;
   generatedPersonas: GeneratedPersona[];
@@ -2085,6 +2711,7 @@ function AutoGeneratePersonaStep({
   onRemovePersona: (personaId: string) => void;
   onAddCustomPersona: (persona: Persona) => void;
   onContinue: () => void;
+  simulationProgress: SimulationJobStatusResponse | null;
 }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [customPersona, setCustomPersona] = useState<Persona>({
@@ -2178,6 +2805,8 @@ function AutoGeneratePersonaStep({
           </div>
         </div>
       </div>
+
+      <SimulationBatchProgressPanel progress={simulationProgress} />
 
       {customOpen ? (
         <CustomPersonaForm persona={customPersona} onChange={updateCustom} onAdd={addCustom} />
@@ -2393,7 +3022,25 @@ function PersonaResultCard({ result }: { result: PersonaSimulationResult }) {
   );
 }
 
-function Results({ result }: { result: SimulationResponse }) {
+function Results({
+  result,
+  revisionHistory,
+  optimizingRevision,
+  autoAcceptRevisions,
+  onAutoAcceptRevisionsChange,
+  onEvaluateBetterMessage,
+  onAcceptRevision,
+  simulationProgress,
+}: {
+  result: SimulationResponse;
+  revisionHistory: RevisionHistoryItem[];
+  optimizingRevision: boolean;
+  autoAcceptRevisions: boolean;
+  onAutoAcceptRevisionsChange: (value: boolean) => void;
+  onEvaluateBetterMessage: () => void;
+  onAcceptRevision: (item: RevisionHistoryItem) => void;
+  simulationProgress: SimulationJobStatusResponse | null;
+}) {
   const debug = result.developmentDebug;
   const isFallback = !result.used_openai || Boolean(result.fallback_reason);
 
@@ -2449,6 +3096,19 @@ function Results({ result }: { result: SimulationResponse }) {
           value={`${result.operationalRisk}/100`}
         />
       </div>
+
+      <LaunchLossPanel result={result} />
+
+      <MessageOptimizerPanel
+        result={result}
+        revisionHistory={revisionHistory}
+        optimizing={optimizingRevision}
+        autoAccept={autoAcceptRevisions}
+        onAutoAcceptChange={onAutoAcceptRevisionsChange}
+        onEvaluateBetterMessage={onEvaluateBetterMessage}
+        onAcceptRevision={onAcceptRevision}
+        simulationProgress={simulationProgress}
+      />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
@@ -2808,6 +3468,11 @@ export default function App() {
   const [serverAdAnalysis, setServerAdAnalysis] = useState<AdAnalysisPreview | null>(null);
   const [generating, setGenerating] = useState(false);
   const [simulating, setSimulating] = useState(false);
+  const [optimizingRevision, setOptimizingRevision] = useState(false);
+  const [autoAcceptRevisions, setAutoAcceptRevisions] = useState(false);
+  const [revisionHistory, setRevisionHistory] = useState<RevisionHistoryItem[]>([]);
+  const [simulationProgress, setSimulationProgress] =
+    useState<SimulationJobStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const latestSimulationRequestRef = useRef(0);
 
@@ -2822,6 +3487,8 @@ export default function App() {
     setForm((current) => ({ ...current, ...update }));
     setServerAdAnalysis(null);
     setAudienceFit(null);
+    setSimulationProgress(null);
+    setRevisionHistory([]);
     if (selectedPersonas.length || personas.length) {
       setInputsChanged(true);
     }
@@ -2950,6 +3617,8 @@ export default function App() {
     setGenerating(true);
     setError(null);
     setResult(null);
+    setSimulationProgress(null);
+    setRevisionHistory([]);
     try {
       const response = await generatePersonas(form);
       const generated = response.personas.slice(0, form.personaCount);
@@ -2987,8 +3656,13 @@ export default function App() {
     setSelectedPersona(simulationPersonas[0] ?? null);
     setSimulating(true);
     setError(null);
+    setSimulationProgress(null);
     try {
-      const simulation = await runSimulation(form, simulationPersonas);
+      const simulation = await runSimulation(form, simulationPersonas, (progress) => {
+        if (requestSequence === latestSimulationRequestRef.current) {
+          setSimulationProgress(progress);
+        }
+      });
       console.log("/api/run-simulation response", simulation);
       if (requestSequence !== latestSimulationRequestRef.current) {
         console.info("Ignoring stale simulation response", {
@@ -3009,6 +3683,19 @@ export default function App() {
         });
       }
       setResult(simulation);
+      setRevisionHistory([
+        {
+          id: `revision-original-${Date.now()}`,
+          label: "Original",
+          message: form.customerFacingCopy,
+          launchLoss: simulation.launchLoss ?? null,
+          overallDecision: simulation.overallDecision,
+          status: "accepted",
+          reason: "Initial message simulation.",
+          result: simulation,
+        },
+      ]);
+      setSimulationProgress(null);
       setActiveTab("results");
     } catch (err) {
       if (requestSequence !== latestSimulationRequestRef.current) {
@@ -3020,6 +3707,135 @@ export default function App() {
         setSimulating(false);
       }
     }
+  }
+
+  async function onEvaluateBetterMessage() {
+    if (!result) return;
+    const currentLoss = result.launchLoss;
+    if (typeof currentLoss !== "number") {
+      setError("Run a simulation with launch loss before optimizing the message.");
+      return;
+    }
+    if (currentLoss <= TARGET_LAUNCH_LOSS) {
+      setError("Stop condition reached: launch loss is already low enough.");
+      return;
+    }
+    const acceptedRounds = revisionHistory.filter(
+      (item) => item.status === "accepted",
+    ).length;
+    if (acceptedRounds > MAX_REVISION_ROUNDS) {
+      setError("Stop condition reached: maximum revision rounds reached.");
+      return;
+    }
+    const candidateMessage = result.betterMessage.trim();
+    if (!candidateMessage) {
+      setError("No better message candidate is available.");
+      return;
+    }
+    if (candidateMessage === form.customerFacingCopy.trim()) {
+      setError("The suggested better message is the same as the current message.");
+      return;
+    }
+
+    const requestSequence = latestSimulationRequestRef.current + 1;
+    latestSimulationRequestRef.current = requestSequence;
+    const revisionIndex = revisionHistory.length + 1;
+    const candidateForm = {
+      ...form,
+      customerFacingCopy: candidateMessage,
+    };
+    setOptimizingRevision(true);
+    setSimulationProgress(null);
+    setError(null);
+    try {
+      const candidateResult = await runSimulation(
+        candidateForm,
+        personas,
+        (progress) => {
+          if (requestSequence === latestSimulationRequestRef.current) {
+            setSimulationProgress(progress);
+          }
+        },
+      );
+      if (requestSequence !== latestSimulationRequestRef.current) return;
+
+      const newLoss = candidateResult.launchLoss ?? 1;
+      const improvement = currentLoss - newLoss;
+      const worsenedDecision =
+        decisionRank(candidateResult.overallDecision) > decisionRank(result.overallDecision);
+      const riskIncrease = keyRiskIncrease(result, candidateResult);
+      const autoAccepted =
+        autoAcceptRevisions &&
+        improvement >= MIN_REVISION_IMPROVEMENT &&
+        !worsenedDecision &&
+        riskIncrease < 10;
+      const status: RevisionHistoryItem["status"] = autoAccepted
+        ? "accepted"
+        : improvement <= 0 || worsenedDecision || riskIncrease >= 10
+          ? "rejected"
+          : "candidate";
+      const reason = autoAccepted
+        ? `Auto-accepted: launch loss improved by ${formatLoss(improvement)}.`
+        : improvement < MIN_REVISION_IMPROVEMENT
+          ? `Not auto-accepted: improvement was below ${formatLoss(MIN_REVISION_IMPROVEMENT)}.`
+          : worsenedDecision
+            ? "Rejected: launch decision worsened."
+            : riskIncrease >= 10
+              ? "Rejected: privacy, fairness, or accessibility risk increased by 10+ points."
+              : "Candidate evaluated. Review before accepting.";
+
+      const historyItem: RevisionHistoryItem = {
+        id: `revision-${Date.now()}`,
+        label: `Revision ${revisionIndex}`,
+        message: candidateMessage,
+        launchLoss: candidateResult.launchLoss ?? null,
+        overallDecision: candidateResult.overallDecision,
+        status,
+        reason,
+        result: candidateResult,
+      };
+      setRevisionHistory((current) => [...current, historyItem]);
+      if (autoAccepted) {
+        setForm((current) => ({
+          ...current,
+          customerFacingCopy: candidateMessage,
+        }));
+        setResult(candidateResult);
+        setInputsChanged(false);
+      }
+      setSimulationProgress(null);
+    } catch (err) {
+      if (requestSequence === latestSimulationRequestRef.current) {
+        setError(
+          err instanceof Error ? err.message : "Revision evaluation failed",
+        );
+      }
+    } finally {
+      if (requestSequence === latestSimulationRequestRef.current) {
+        setOptimizingRevision(false);
+        setSimulationProgress(null);
+      }
+    }
+  }
+
+  function onAcceptRevision(item: RevisionHistoryItem) {
+    setForm((current) => ({
+      ...current,
+      customerFacingCopy: item.message,
+    }));
+    setResult(item.result);
+    setInputsChanged(false);
+    setRevisionHistory((current) =>
+      current.map((revision) =>
+        revision.id === item.id
+          ? {
+              ...revision,
+              status: "accepted",
+              reason: "Accepted manually after review.",
+            }
+          : revision,
+      ),
+    );
   }
 
   return (
@@ -3440,6 +4256,7 @@ export default function App() {
                         setPersonas([]);
                         setSelectedPersona(null);
                         setResult(null);
+                        setSimulationProgress(null);
                       }
                       setPersonaSetupMode(nextMode);
                       setError(null);
@@ -3465,6 +4282,7 @@ export default function App() {
                 result={result}
                 generating={generating}
                 simulating={simulating}
+                simulationProgress={simulationProgress}
                 onGenerate={() => void onGenerateAutoPersonas()}
                 onSelectGeneratedPersona={setSelectedPersona}
                 onRemovePersona={(personaId) => {
@@ -3519,6 +4337,7 @@ export default function App() {
                 }}
                 onContinue={() => void onRunSimulation()}
                 simulating={simulating}
+                simulationProgress={simulationProgress}
               />
             )}
           </div>
@@ -3558,7 +4377,16 @@ export default function App() {
                     Run simulation again
                   </button>
                 </div>
-                <Results result={result} />
+                <Results
+                  result={result}
+                  revisionHistory={revisionHistory}
+                  optimizingRevision={optimizingRevision}
+                  autoAcceptRevisions={autoAcceptRevisions}
+                  onAutoAcceptRevisionsChange={setAutoAcceptRevisions}
+                  onEvaluateBetterMessage={() => void onEvaluateBetterMessage()}
+                  onAcceptRevision={onAcceptRevision}
+                  simulationProgress={simulationProgress}
+                />
                 <SimulationAdvisorChat
                   form={form}
                   personas={personas}

@@ -185,12 +185,25 @@ export interface SimulationResponse {
   openaiAttempts?: number | null;
   openaiAttemptResponseIds?: string[] | null;
   postProcessingWarning?: string | null;
+  launchLoss?: number | null;
+  launchLossBreakdown?: Record<string, number> | null;
+  batchLaunchLosses?: BatchLaunchLoss[];
   developmentDebug?: DevelopmentDebug | null;
   used_openai: boolean;
   fallback_reason: string | null;
 }
 
+export interface BatchLaunchLoss {
+  batchIndex: number;
+  personaStart: number;
+  personaEnd: number;
+  personaCount: number;
+  launchLoss: number;
+  overallDecision: OverallDecision;
+}
+
 export type SimulationJobStatus = "queued" | "running" | "completed" | "failed";
+export type SimulationBatchStatus = "queued" | "running" | "completed" | "failed";
 
 export interface SimulationJobCreateResponse {
   jobId: string;
@@ -206,6 +219,21 @@ export interface SimulationJobStatusResponse {
   requestId: string;
   error?: string | null;
   result?: SimulationResponse | null;
+  currentBatch?: number | null;
+  totalBatches?: number | null;
+  completedBatches?: number;
+  batchProgress?: SimulationBatchProgress[];
+}
+
+export interface SimulationBatchProgress {
+  batchIndex: number;
+  personaStart: number;
+  personaEnd: number;
+  personaCount: number;
+  status: SimulationBatchStatus;
+  launchLoss?: number | null;
+  overallDecision?: OverallDecision | null;
+  error?: string | null;
 }
 
 export interface FeatureTestInput {

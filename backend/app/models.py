@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 OverallDecision = Literal["Launch", "Revise before release", "Do not launch"]
 OverallImpact = Literal["Negative", "Neutral", "Positive"]
 SimulationJobStatus = Literal["queued", "running", "completed", "failed"]
+SimulationBatchStatus = Literal["queued", "running", "completed", "failed"]
 
 
 class StrictBaseModel(BaseModel):
@@ -210,6 +211,15 @@ class PersonaSimulationResult(StrictBaseModel):
     betterMessage: str
 
 
+class BatchLaunchLoss(StrictBaseModel):
+    batchIndex: int = Field(ge=1)
+    personaStart: int = Field(ge=1)
+    personaEnd: int = Field(ge=1)
+    personaCount: int = Field(ge=1)
+    launchLoss: float = Field(ge=0, le=1)
+    overallDecision: OverallDecision
+
+
 class SimulationResultResponse(StrictBaseModel):
     overallDecision: OverallDecision
     overallSummary: str
@@ -241,6 +251,9 @@ class SimulationResultResponse(StrictBaseModel):
     openaiAttempts: int | None = None
     openaiAttemptResponseIds: list[str] | None = None
     postProcessingWarning: str | None = None
+    launchLoss: float | None = Field(default=None, ge=0, le=1)
+    launchLossBreakdown: dict[str, float] | None = None
+    batchLaunchLosses: list[BatchLaunchLoss] = Field(default_factory=list)
     developmentDebug: DevelopmentDebug | None = None
     used_openai: bool
     fallback_reason: str | None
@@ -252,6 +265,17 @@ class SimulationJobCreateResponse(StrictBaseModel):
     requestId: str
 
 
+class SimulationBatchProgress(StrictBaseModel):
+    batchIndex: int = Field(ge=1)
+    personaStart: int = Field(ge=1)
+    personaEnd: int = Field(ge=1)
+    personaCount: int = Field(ge=1)
+    status: SimulationBatchStatus
+    launchLoss: float | None = Field(default=None, ge=0, le=1)
+    overallDecision: OverallDecision | None = None
+    error: str | None = None
+
+
 class SimulationJobStatusResponse(StrictBaseModel):
     jobId: str
     status: SimulationJobStatus
@@ -260,6 +284,10 @@ class SimulationJobStatusResponse(StrictBaseModel):
     requestId: str
     error: str | None = None
     result: SimulationResultResponse | None = None
+    currentBatch: int | None = None
+    totalBatches: int | None = None
+    completedBatches: int = 0
+    batchProgress: list[SimulationBatchProgress] = Field(default_factory=list)
 
 
 class AdvisorChatMessage(StrictBaseModel):

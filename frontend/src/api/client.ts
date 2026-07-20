@@ -292,6 +292,7 @@ export async function generatePersonas(
 export async function runSimulation(
   form: FeatureTestInput | SimulationForm,
   personas: GeneratedPersona[],
+  onProgress?: (job: SimulationJobStatusResponse) => void,
 ): Promise<SimulationResponse> {
   const legacyForm = toLegacySimulationForm(form);
   const startedAt = performance.now();
@@ -361,7 +362,7 @@ export async function runSimulation(
       durationMs,
       receivedAt: new Date().toISOString(),
     });
-    return await pollSimulationJob(job.jobId, startedAt);
+    return await pollSimulationJob(job.jobId, startedAt, onProgress);
   } catch (error) {
     const durationMs = Math.round(performance.now() - startedAt);
     if (error instanceof DOMException && error.name === "AbortError") {
@@ -385,6 +386,7 @@ export async function runSimulation(
 async function pollSimulationJob(
   jobId: string,
   startedAt: number,
+  onProgress?: (job: SimulationJobStatusResponse) => void,
 ): Promise<SimulationResponse> {
   while (performance.now() - startedAt < SIMULATION_JOB_POLL_TIMEOUT_MS) {
     await delay(SIMULATION_JOB_POLL_INTERVAL_MS);
@@ -409,6 +411,7 @@ async function pollSimulationJob(
     }
 
     const job = payload as SimulationJobStatusResponse;
+    onProgress?.(job);
     console.info("/api/run-simulation-jobs poll received", {
       jobId,
       status: job.status,

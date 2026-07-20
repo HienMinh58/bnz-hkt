@@ -94,6 +94,9 @@ RUNTIME_RESULT_FIELDS = {
     "openaiAttempts",
     "openaiAttemptResponseIds",
     "postProcessingWarning",
+    "launchLoss",
+    "launchLossBreakdown",
+    "batchLaunchLosses",
 }
 
 

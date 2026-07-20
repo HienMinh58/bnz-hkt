@@ -25,6 +25,8 @@ from app.models import (
     GeneratePersonasResponse,
     GeneratedPersona,
     LegacyPersona,
+    BatchLaunchLoss,
+    SimulationBatchProgress,
     SegmentFitSummary,
     DevelopmentDebug,
     SimulationJobCreateResponse,
@@ -51,6 +53,9 @@ SIMULATION_JOBS_LOCK = RLock()
 SIMULATION_JOB_TTL_SECONDS = 60 * 60
 SIMULATION_JOB_LIMIT = 100
 AD_ANALYSIS_PROFILE_COUNT = 6
+DEFAULT_PERSONA_GENERATION_BATCH_SIZE = 10
+DEFAULT_MAX_PERSONA_COUNT = 50
+DEFAULT_SIMULATION_BATCH_SIZE = 10
 
 
 def _cors_origins_from_env() -> list[str]:
@@ -387,7 +392,7 @@ def generate_personas(
             request_id,
             _utc_timestamp(),
         )
-        result = generate_personas_with_openai(
+        result = _generate_personas_with_optional_batches(
             feature_name=request.featureName,
             banking_message=request.bankingMessage,
             target_customers=request.targetCustomers,
@@ -448,6 +453,93 @@ def generate_personas(
         ) from exc
 
 
+def _generate_personas_with_optional_batches(
+    feature_name: str,
+    banking_message: str,
+    target_customers: str,
+    channel: str,
+    send_timing: str,
+    persona_count: int,
+    request_id: str,
+) -> GeneratePersonasResponse:
+    max_persona_count = _int_env("MAX_PERSONA_COUNT", DEFAULT_MAX_PERSONA_COUNT)
+    if persona_count > max_persona_count:
+        raise ValueError(
+            f"personaCount must be <= {max_persona_count} in this environment"
+        )
+
+    batch_size = _int_env(
+        "PERSONA_GENERATION_BATCH_SIZE",
+        DEFAULT_PERSONA_GENERATION_BATCH_SIZE,
+    )
+    if persona_count <= batch_size:
+        return generate_personas_with_openai(
+            feature_name=feature_name,
+            banking_message=banking_message,
+            target_customers=target_customers,
+            channel=channel,
+            send_timing=send_timing,
+            persona_count=persona_count,
+            request_id=request_id,
+        )
+
+    personas: list[GeneratedPersona] = []
+    batch_count = (persona_count + batch_size - 1) // batch_size
+    fallback_reasons: list[str] = []
+    for batch_index in range(batch_count):
+        remaining = persona_count - len(personas)
+        current_batch_size = min(batch_size, remaining)
+        batch_number = batch_index + 1
+        logger.info(
+            "generate_personas_batch_start requestId=%s timestamp=%s "
+            "batch=%s totalBatches=%s batchSize=%s",
+            request_id,
+            _utc_timestamp(),
+            batch_number,
+            batch_count,
+            current_batch_size,
+        )
+        batch_result = generate_personas_with_openai(
+            feature_name=feature_name,
+            banking_message=(
+                f"{banking_message}\n\nBatch instruction: generate personas for "
+                f"batch {batch_number} of {batch_count}. Make these personas "
+                "distinct from earlier batches by varying life context, digital "
+                "confidence, privacy sensitivity, language/accessibility needs, "
+                "and financial stress."
+            ),
+            target_customers=target_customers,
+            channel=channel,
+            send_timing=send_timing,
+            persona_count=current_batch_size,
+            request_id=f"{request_id}_batch_{batch_number}",
+        )
+        personas.extend(batch_result.personas)
+        if batch_result.fallback_reason:
+            fallback_reasons.append(
+                f"batch_{batch_number}: {batch_result.fallback_reason}"
+            )
+        logger.info(
+            "generate_personas_batch_end requestId=%s timestamp=%s "
+            "batch=%s totalBatches=%s generatedTotal=%s",
+            request_id,
+            _utc_timestamp(),
+            batch_number,
+            batch_count,
+            len(personas),
+        )
+
+    normalized = [
+        persona.model_copy(update={"id": f"persona_{index + 1}"})
+        for index, persona in enumerate(personas[:persona_count])
+    ]
+    return GeneratePersonasResponse(
+        personas=normalized,
+        used_openai=True,
+        fallback_reason="; ".join(fallback_reasons) if fallback_reasons else None,
+    )
+
+
 @app.post("/api/run-simulation-jobs", response_model=SimulationJobCreateResponse)
 async def create_simulation_job(
     background_tasks: BackgroundTasks,
@@ -472,6 +564,7 @@ async def create_simulation_job(
     persona_names = [persona.name for persona in generated_personas]
     now = _utc_timestamp()
     now_epoch = time.time()
+    batch_progress = _initial_simulation_batch_progress(generated_personas)
 
     with SIMULATION_JOBS_LOCK:
         _cleanup_simulation_jobs_locked(now_epoch)
@@ -486,6 +579,10 @@ async def create_simulation_job(
             "updatedAtEpoch": now_epoch,
             "error": None,
             "result": None,
+            "currentBatch": None,
+            "totalBatches": len(batch_progress),
+            "completedBatches": 0,
+            "batchProgress": batch_progress,
         }
 
     logger.info(
@@ -843,7 +940,8 @@ def _run_simulation_job(
             request_id,
             _utc_timestamp(),
         )
-        result = simulate_with_openai(
+        result = _simulate_with_optional_batches(
+            job_id=job_id,
             personas=generated_personas,
             feature_name=feature_name,
             banking_message=banking_message,
@@ -946,6 +1044,423 @@ def _run_simulation_job(
         )
 
 
+def _simulate_with_optional_batches(
+    job_id: str | None,
+    personas: list[GeneratedPersona],
+    feature_name: str,
+    banking_message: str,
+    target_customers: str,
+    channel: str,
+    send_timing: str,
+    image_bytes: bytes | None,
+    image_content_type: str | None,
+    request_id: str,
+) -> SimulationResultResponse:
+    batch_size = _int_env("SIMULATION_BATCH_SIZE", DEFAULT_SIMULATION_BATCH_SIZE)
+    if len(personas) <= batch_size:
+        if job_id is not None:
+            _update_simulation_batch_progress(
+                job_id=job_id,
+                batch_index=1,
+                status="running",
+            )
+        try:
+            result = _with_launch_loss(
+                simulate_with_openai(
+                    personas=personas,
+                    feature_name=feature_name,
+                    banking_message=banking_message,
+                    target_customers=target_customers,
+                    channel=channel,
+                    send_timing=send_timing,
+                    image_bytes=image_bytes,
+                    image_content_type=image_content_type,
+                    request_id=request_id,
+                )
+            )
+        except Exception as exc:
+            if job_id is not None:
+                _update_simulation_batch_progress(
+                    job_id=job_id,
+                    batch_index=1,
+                    status="failed",
+                    error=normalize_fallback_reason(exc),
+                )
+            raise
+        if job_id is not None:
+            _update_simulation_batch_progress(
+                job_id=job_id,
+                batch_index=1,
+                status="completed",
+                launch_loss=result.launchLoss,
+                overall_decision=result.overallDecision,
+            )
+        return result
+
+    batch_results: list[SimulationResultResponse] = []
+    batch_losses: list[BatchLaunchLoss] = []
+    total_batches = (len(personas) + batch_size - 1) // batch_size
+    for batch_index, start in enumerate(range(0, len(personas), batch_size), start=1):
+        batch_personas = personas[start : start + batch_size]
+        if job_id is not None:
+            _update_simulation_batch_progress(
+                job_id=job_id,
+                batch_index=batch_index,
+                status="running",
+            )
+        logger.info(
+            "simulation_batch_start requestId=%s timestamp=%s batch=%s "
+            "totalBatches=%s personaStart=%s personaEnd=%s",
+            request_id,
+            _utc_timestamp(),
+            batch_index,
+            total_batches,
+            start + 1,
+            start + len(batch_personas),
+        )
+        try:
+            batch_result = _with_launch_loss(
+                simulate_with_openai(
+                    personas=batch_personas,
+                    feature_name=feature_name,
+                    banking_message=(
+                        f"{banking_message}\n\nBatch simulation instruction: this is "
+                        f"batch {batch_index} of {total_batches}. Evaluate only the "
+                        "personas supplied in this batch. The backend will aggregate "
+                        "batch-level risk results after all batches complete."
+                    ),
+                    target_customers=target_customers,
+                    channel=channel,
+                    send_timing=send_timing,
+                    image_bytes=image_bytes,
+                    image_content_type=image_content_type,
+                    request_id=f"{request_id}_sim_batch_{batch_index}",
+                )
+            )
+        except Exception as exc:
+            if job_id is not None:
+                _update_simulation_batch_progress(
+                    job_id=job_id,
+                    batch_index=batch_index,
+                    status="failed",
+                    error=normalize_fallback_reason(exc),
+                )
+            raise
+        batch_results.append(batch_result)
+        batch_losses.append(
+            BatchLaunchLoss(
+                batchIndex=batch_index,
+                personaStart=start + 1,
+                personaEnd=start + len(batch_personas),
+                personaCount=len(batch_personas),
+                launchLoss=batch_result.launchLoss or 0,
+                overallDecision=batch_result.overallDecision,
+            )
+        )
+        if job_id is not None:
+            _update_simulation_batch_progress(
+                job_id=job_id,
+                batch_index=batch_index,
+                status="completed",
+                launch_loss=batch_result.launchLoss,
+                overall_decision=batch_result.overallDecision,
+            )
+        logger.info(
+            "simulation_batch_end requestId=%s timestamp=%s batch=%s "
+            "totalBatches=%s personaResults=%s decision=%s launchLoss=%s",
+            request_id,
+            _utc_timestamp(),
+            batch_index,
+            total_batches,
+            len(batch_result.personaResults),
+            batch_result.overallDecision,
+            batch_result.launchLoss,
+        )
+
+    return _aggregate_simulation_results(
+        request_id=request_id,
+        personas=personas,
+        batch_results=batch_results,
+        total_batches=total_batches,
+        batch_launch_losses=batch_losses,
+    )
+
+
+def _with_launch_loss(
+    result: SimulationResultResponse,
+    batch_launch_losses: list[BatchLaunchLoss] | None = None,
+) -> SimulationResultResponse:
+    loss, breakdown = _calculate_launch_loss(result)
+    return result.model_copy(
+        update={
+            "launchLoss": loss,
+            "launchLossBreakdown": breakdown,
+            "batchLaunchLosses": batch_launch_losses or result.batchLaunchLosses,
+        }
+    )
+
+
+def _calculate_launch_loss(
+    result: SimulationResultResponse,
+) -> tuple[float, dict[str, float]]:
+    persona_count = len(result.personaResults)
+    avg_stress = _average_int(item.stressRisk for item in result.personaResults)
+    avg_financial = _average_int(
+        item.financialWellbeingImpact for item in result.personaResults
+    )
+    breakdown = {
+        "clarity": round((100 - result.clarityScore) / 100, 4),
+        "trust": round((100 - result.customerTrustScore) / 100, 4),
+        "stress": round(avg_stress / 100, 4) if persona_count else 0,
+        "fairness": round(result.fairnessRisk / 100, 4),
+        "accessibility": round(result.accessibilityRisk / 100, 4),
+        "privacy": round(result.privacyRisk / 100, 4),
+        "operational": round(result.operationalRisk / 100, 4),
+        "financialWellbeing": round(avg_financial / 100, 4) if persona_count else 0,
+    }
+    weights = {
+        "clarity": 0.18,
+        "trust": 0.18,
+        "stress": 0.14,
+        "fairness": 0.13,
+        "accessibility": 0.10,
+        "privacy": 0.12,
+        "operational": 0.08,
+        "financialWellbeing": 0.07,
+    }
+    loss = sum(breakdown[key] * weight for key, weight in weights.items())
+    return round(max(0, min(1, loss)), 4), breakdown
+
+
+def _aggregate_simulation_results(
+    request_id: str,
+    personas: list[GeneratedPersona],
+    batch_results: list[SimulationResultResponse],
+    total_batches: int,
+    batch_launch_losses: list[BatchLaunchLoss],
+) -> SimulationResultResponse:
+    persona_results = [
+        result
+        for batch in batch_results
+        for result in batch.personaResults
+    ]
+    if not batch_results:
+        raise RuntimeError("simulation_batch_error: no batch results")
+
+    decision_rank = {
+        "Launch": 0,
+        "Revise before release": 1,
+        "Do not launch": 2,
+    }
+    overall_decision = max(
+        (batch.overallDecision for batch in batch_results),
+        key=lambda decision: decision_rank[decision],
+    )
+    impact_rank = {"Positive": 0, "Neutral": 1, "Negative": 2}
+    financial_impact = max(
+        (batch.financialWellbeingImpact for batch in batch_results),
+        key=lambda impact: impact_rank[impact],
+    )
+
+    top_risks = _unique_ordered(
+        risk for batch in batch_results for risk in batch.topRisks
+    )[:8]
+    top_recommendations = _unique_ordered(
+        recommendation
+        for batch in batch_results
+        for recommendation in batch.topRecommendations
+    )[:3]
+    while len(top_recommendations) < 3:
+        top_recommendations.append(
+            "Review high-risk persona reactions before releasing the message."
+        )
+
+    affected_personas = sorted(
+        persona_results,
+        key=lambda item: max(
+            item.stressRisk,
+            item.fairnessRisk,
+            item.accessibilityRisk,
+            item.privacyRisk,
+            item.operationalRisk,
+            100 - item.clarityScore,
+            100 - item.trustScore,
+        ),
+        reverse=True,
+    )
+    top_affected = [item.personaName for item in affected_personas[:8]]
+    def _batch_max_risk(batch: SimulationResultResponse) -> int:
+        persona_risk_scores = [
+            max(
+                item.stressRisk,
+                item.fairnessRisk,
+                item.accessibilityRisk,
+                item.privacyRisk,
+                item.operationalRisk,
+                100 - item.clarityScore,
+                100 - item.trustScore,
+            )
+            for item in batch.personaResults
+        ]
+        summary_risk_scores = [
+            batch.fairnessRisk,
+            batch.accessibilityRisk,
+            batch.privacyRisk,
+            batch.operationalRisk,
+            100 - batch.clarityScore,
+            100 - batch.customerTrustScore,
+        ]
+        return max([*persona_risk_scores, *summary_risk_scores], default=0)
+
+    highest_risk_batch = max(batch_results, key=_batch_max_risk)
+
+    openai_response_ids = _unique_ordered(
+        response_id
+        for batch in batch_results
+        for response_id in (batch.openaiAttemptResponseIds or [])
+    )
+    rule_based_checks = [
+        check
+        for batch in batch_results
+        for check in batch.ruleBasedChecks
+    ]
+
+    aggregated = SimulationResultResponse(
+        overallDecision=overall_decision,
+        overallSummary=(
+            f"Aggregated {len(persona_results)} persona reactions across "
+            f"{total_batches} simulation batches. Overall decision reflects "
+            "the highest-risk batch and combined persona-level findings."
+        ),
+        clarityScore=_average_int(batch.clarityScore for batch in batch_results),
+        customerTrustScore=_average_int(
+            batch.customerTrustScore for batch in batch_results
+        ),
+        financialWellbeingImpact=financial_impact,
+        fairnessRisk=_average_int(batch.fairnessRisk for batch in batch_results),
+        accessibilityRisk=_average_int(
+            batch.accessibilityRisk for batch in batch_results
+        ),
+        privacyRisk=_average_int(batch.privacyRisk for batch in batch_results),
+        operationalRisk=_average_int(
+            batch.operationalRisk for batch in batch_results
+        ),
+        topRisks=top_risks,
+        topAffectedPersonas=top_affected,
+        topRecommendations=top_recommendations,
+        betterMessage=highest_risk_batch.betterMessage,
+        personaResults=persona_results,
+        uiScreenshotAnalysis=next(
+            (
+                batch.uiScreenshotAnalysis
+                for batch in batch_results
+                if batch.uiScreenshotAnalysis is not None
+            ),
+            None,
+        ),
+        ruleBasedChecks=rule_based_checks,
+        openaiAttempts=sum(batch.openaiAttempts or 0 for batch in batch_results),
+        openaiAttemptResponseIds=openai_response_ids,
+        openaiDurationMs=sum(batch.openaiDurationMs or 0 for batch in batch_results),
+        postProcessingDurationMs=sum(
+            batch.postProcessingDurationMs or 0 for batch in batch_results
+        ),
+        postProcessingWarning=(
+            f"Aggregated from {total_batches} simulation batches for "
+            f"{len(personas)} personas."
+        ),
+        used_openai=all(batch.used_openai for batch in batch_results),
+        fallback_reason="; ".join(
+            batch.fallback_reason
+            for batch in batch_results
+            if batch.fallback_reason
+        ) or None,
+    )
+    return _with_launch_loss(
+        aggregated,
+        batch_launch_losses=batch_launch_losses,
+    )
+
+
+def _average_int(values: object) -> int:
+    items = [int(value) for value in values]
+    if not items:
+        return 0
+    return max(0, min(100, round(sum(items) / len(items))))
+
+
+def _unique_ordered(values: object) -> list:
+    seen = set()
+    unique = []
+    for value in values:
+        if value is None or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _initial_simulation_batch_progress(
+    personas: list[GeneratedPersona],
+) -> list[SimulationBatchProgress]:
+    batch_size = _int_env("SIMULATION_BATCH_SIZE", DEFAULT_SIMULATION_BATCH_SIZE)
+    progress: list[SimulationBatchProgress] = []
+    for batch_index, start in enumerate(range(0, len(personas), batch_size), start=1):
+        persona_count = min(batch_size, len(personas) - start)
+        progress.append(
+            SimulationBatchProgress(
+                batchIndex=batch_index,
+                personaStart=start + 1,
+                personaEnd=start + persona_count,
+                personaCount=persona_count,
+                status="queued",
+            )
+        )
+    return progress
+
+
+def _update_simulation_batch_progress(
+    job_id: str,
+    batch_index: int,
+    status: str,
+    launch_loss: float | None = None,
+    overall_decision: str | None = None,
+    error: str | None = None,
+) -> None:
+    now = _utc_timestamp()
+    now_epoch = time.time()
+    with SIMULATION_JOBS_LOCK:
+        job = SIMULATION_JOBS.get(job_id)
+        if job is None:
+            return
+        updated_progress = []
+        for item in job.get("batchProgress", []):
+            if item.batchIndex != batch_index:
+                updated_progress.append(item)
+                continue
+            updated_progress.append(
+                item.model_copy(
+                    update={
+                        "status": status,
+                        "launchLoss": launch_loss
+                        if launch_loss is not None
+                        else item.launchLoss,
+                        "overallDecision": overall_decision
+                        if overall_decision is not None
+                        else item.overallDecision,
+                        "error": error,
+                    }
+                )
+            )
+        job["batchProgress"] = updated_progress
+        job["currentBatch"] = batch_index if status == "running" else None
+        job["completedBatches"] = sum(
+            1 for item in updated_progress if item.status == "completed"
+        )
+        job["updatedAt"] = now
+        job["updatedAtEpoch"] = now_epoch
+
+
 def _update_simulation_job(
     job_id: str,
     status: str,
@@ -978,6 +1493,10 @@ def _simulation_job_response(job: dict) -> SimulationJobStatusResponse:
         requestId=job["requestId"],
         error=job.get("error"),
         result=job.get("result"),
+        currentBatch=job.get("currentBatch"),
+        totalBatches=job.get("totalBatches"),
+        completedBatches=job.get("completedBatches", 0),
+        batchProgress=job.get("batchProgress", []),
     )
 
 
@@ -1144,6 +1663,13 @@ def _utc_timestamp() -> str:
 
 def _duration_ms(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 def _openai_error_status(error: str) -> int:
