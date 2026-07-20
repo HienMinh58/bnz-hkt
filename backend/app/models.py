@@ -328,3 +328,39 @@ class AdvisorChatResponse(StrictBaseModel):
     openaiAttempts: int | None = None
     openaiAttemptResponseIds: list[str] | None = None
     openaiDurationMs: int | None = None
+
+
+class RevisionCandidate(StrictBaseModel):
+    message: str = Field(min_length=1, max_length=6000)
+    rationale: str = Field(min_length=1, max_length=1200)
+
+
+class RevisionHistoryContextItem(StrictBaseModel):
+    label: str
+    message: str
+    launchLoss: float | None = Field(default=None, ge=0, le=1)
+    status: Literal["accepted", "candidate", "rejected"]
+    reason: str
+
+
+class RevisionGenerationRequest(StrictBaseModel):
+    campaignInput: AdvisorCampaignInput
+    personas: list[GeneratedPersona] = Field(min_length=1, max_length=100)
+    currentResult: SimulationResultResponse
+    bestMessage: str = Field(min_length=1, max_length=6000)
+    previousCandidates: list[RevisionHistoryContextItem] = Field(default_factory=list)
+    iteration: int = Field(ge=1, le=20)
+    targetLaunchLoss: float = Field(ge=0, le=1)
+    minImprovement: float = Field(ge=0, le=1)
+
+
+class RevisionGenerationResponse(StrictBaseModel):
+    candidate: RevisionCandidate
+    used_openai: bool
+    fallback_reason: str | None
+    requestId: str | None = None
+    durationMs: int | None = None
+    openaiResponseId: str | None = None
+    openaiAttempts: int | None = None
+    openaiAttemptResponseIds: list[str] | None = None
+    openaiDurationMs: int | None = None

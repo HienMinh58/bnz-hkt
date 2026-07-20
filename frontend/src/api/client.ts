@@ -12,6 +12,8 @@ import type {
   SimulationJobStatusResponse,
   SimulationForm,
   SimulationResponse,
+  RevisionGenerationRequest,
+  RevisionGenerationResponse,
 } from "../types/simulation";
 import { supabase } from "./supabaseClient";
 
@@ -23,6 +25,7 @@ const CREATE_SIMULATION_JOB_TIMEOUT_MS = 60_000;
 const SIMULATION_JOB_POLL_INTERVAL_MS = 3_000;
 const SIMULATION_JOB_POLL_TIMEOUT_MS = 10 * 60_000;
 const ADVISOR_CHAT_TIMEOUT_MS = 180_000;
+const GENERATE_REVISION_TIMEOUT_MS = 180_000;
 
 async function authHeaders(): Promise<Record<string, string>> {
   const { data } = await supabase.auth.getSession();
@@ -483,6 +486,62 @@ export async function askSimulationAdvisor(
         `Advisor chat timed out after ${Math.round(
           ADVISOR_CHAT_TIMEOUT_MS / 1000,
         )} seconds. Try a shorter question or retry later.`,
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+export async function generateRevision(
+  request: RevisionGenerationRequest,
+): Promise<RevisionGenerationResponse> {
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    GENERATE_REVISION_TIMEOUT_MS,
+  );
+
+  try {
+    const response = await fetch("/api/generate-revision", {
+      method: "POST",
+      headers: {
+        ...(await authHeaders()),
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(request),
+    });
+    const durationMs = Math.round(performance.now() - startedAt);
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const requestId = detail?.requestId ?? payload?.requestId ?? null;
+      const error = detail?.error ?? payload?.error ?? "Revision generation failed";
+      throw new Error(
+        requestId
+          ? `Revision generation failed (${requestId}): ${error}`
+          : `Revision generation failed: ${error}`,
+      );
+    }
+
+    console.info("/api/generate-revision response received", {
+      requestId: payload?.requestId,
+      durationMs,
+      backendDurationMs: payload?.durationMs,
+      usedOpenAI: payload?.used_openai,
+      receivedAt: new Date().toISOString(),
+    });
+    return payload as RevisionGenerationResponse;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(
+        `Revision generation timed out after ${Math.round(
+          GENERATE_REVISION_TIMEOUT_MS / 1000,
+        )} seconds. Try fewer iterations or retry later.`,
       );
     }
     throw error;

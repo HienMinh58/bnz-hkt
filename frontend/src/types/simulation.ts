@@ -302,3 +302,39 @@ export interface AdvisorChatResponse {
   openaiAttemptResponseIds?: string[] | null;
   openaiDurationMs?: number | null;
 }
+
+export interface RevisionCandidate {
+  message: string;
+  rationale: string;
+}
+
+export interface RevisionHistoryContextItem {
+  label: string;
+  message: string;
+  launchLoss?: number | null;
+  status: "accepted" | "candidate" | "rejected";
+  reason: string;
+}
+
+export interface RevisionGenerationRequest {
+  campaignInput: AdvisorCampaignInput;
+  personas: GeneratedPersona[];
+  currentResult: SimulationResponse;
+  bestMessage: string;
+  previousCandidates: RevisionHistoryContextItem[];
+  iteration: number;
+  targetLaunchLoss: number;
+  minImprovement: number;
+}
+
+export interface RevisionGenerationResponse {
+  candidate: RevisionCandidate;
+  used_openai: boolean;
+  fallback_reason: string | null;
+  requestId?: string | null;
+  durationMs?: number | null;
+  openaiResponseId?: string | null;
+  openaiAttempts?: number | null;
+  openaiAttemptResponseIds?: string[] | null;
+  openaiDurationMs?: number | null;
+}

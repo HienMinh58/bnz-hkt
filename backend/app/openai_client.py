@@ -18,6 +18,8 @@ from app.models import (
     SyntheticFeatureProfilesResponse,
     GeneratePersonasResponse,
     GeneratedPersona,
+    RevisionGenerationRequest,
+    RevisionGenerationResponse,
     SimulationResultResponse,
 )
 from app.scoring import merge_ai_and_rules
@@ -60,6 +62,8 @@ def _schema_for(model: Type[BaseModel]) -> dict:
         _remove_ad_analysis_runtime_fields(schema)
     if model is AdvisorChatResponse:
         _remove_advisor_chat_runtime_fields(schema)
+    if model is RevisionGenerationResponse:
+        _remove_revision_generation_runtime_fields(schema)
     _make_openai_strict_schema(schema)
     return schema
 
@@ -110,6 +114,16 @@ ADVISOR_CHAT_RUNTIME_FIELDS = {
 }
 
 
+REVISION_GENERATION_RUNTIME_FIELDS = {
+    "requestId",
+    "durationMs",
+    "openaiResponseId",
+    "openaiAttempts",
+    "openaiAttemptResponseIds",
+    "openaiDurationMs",
+}
+
+
 def _remove_generate_personas_runtime_fields(schema: dict) -> None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
@@ -140,6 +154,14 @@ def _remove_advisor_chat_runtime_fields(schema: dict) -> None:
     if not isinstance(properties, dict):
         return
     for field in ADVISOR_CHAT_RUNTIME_FIELDS:
+        properties.pop(field, None)
+
+
+def _remove_revision_generation_runtime_fields(schema: dict) -> None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    for field in REVISION_GENERATION_RUNTIME_FIELDS:
         properties.pop(field, None)
 
 
@@ -720,6 +742,85 @@ Simulation context JSON:
     )
     try:
         parsed = AdvisorChatResponse.model_validate_json(
+            openai_result.response.output_text
+        )
+    except Exception as exc:
+        setattr(exc, "attempts", openai_result.attempts)
+        setattr(exc, "openai_response_ids", openai_result.response_ids)
+        setattr(exc, "openai_response_id", getattr(openai_result.response, "id", None))
+        setattr(exc, "openai_duration_ms", openai_result.duration_ms)
+        raise
+    return parsed.model_copy(
+        update={
+            "used_openai": True,
+            "fallback_reason": None,
+            "openaiResponseId": getattr(openai_result.response, "id", None),
+            "openaiAttempts": openai_result.attempts,
+            "openaiAttemptResponseIds": openai_result.response_ids,
+            "openaiDurationMs": openai_result.duration_ms,
+        }
+    )
+
+
+def generate_revision_with_openai(
+    request: RevisionGenerationRequest,
+    request_id: str | None = None,
+) -> RevisionGenerationResponse:
+    context = request.model_dump(
+        exclude={
+            "currentResult": {
+                "rawOpenAIResult",
+                "developmentDebug",
+                "openaiResponseId",
+                "openaiAttempts",
+                "openaiAttemptResponseIds",
+            }
+        }
+    )
+    prompt = f"""
+You are running a training-style copy optimization loop for a synthetic banking
+pre-launch risk review.
+
+Create the next campaign message candidate for iteration {request.iteration}.
+Return valid JSON only.
+
+Optimization objective:
+- Reduce launch loss versus the current best accepted message.
+- Target launch loss: {round(request.targetLaunchLoss * 100)} out of 100.
+- Minimum useful improvement: {round(request.minImprovement * 100)} points.
+- Address the highest current risk drivers and affected personas.
+- Preserve or improve privacy, fairness, accessibility, and financial wellbeing.
+
+Rules:
+- Do not reuse any previous candidate verbatim.
+- Do not personalize by identity or protected attributes.
+- Do not imply pre-approval, guaranteed eligibility, artificial scarcity, or
+  pressure to borrow.
+- Keep the message customer-facing and ready to test.
+- If the best possible next step is a cautious rewrite, still provide one.
+- Set used_openai to true and fallback_reason to null.
+
+Optimization context JSON:
+{json.dumps(context, indent=2)}
+"""
+    openai_result = _responses_create_with_retry(
+        request_id=request_id,
+        endpoint="generate-revision",
+        persona_count=len(request.personas),
+        image_uploaded=request.campaignInput.screenshotUploaded,
+        model=_model(),
+        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "revision_generation_response",
+                "schema": _schema_for(RevisionGenerationResponse),
+                "strict": True,
+            }
+        },
+    )
+    try:
+        parsed = RevisionGenerationResponse.model_validate_json(
             openai_result.response.output_text
         )
     except Exception as exc:

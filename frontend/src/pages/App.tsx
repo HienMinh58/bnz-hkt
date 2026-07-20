@@ -30,6 +30,7 @@ import {
   analyzeAd,
   askSimulationAdvisor,
   generatePersonas,
+  generateRevision,
   runSimulation,
 } from "../api/client";
 import type {
@@ -44,6 +45,18 @@ import type {
   SimulationJobStatusResponse,
   SimulationResponse,
 } from "../types/simulation";
+import {
+  MAX_REVISION_ROUNDS,
+  MIN_REVISION_IMPROVEMENT,
+  TARGET_LAUNCH_LOSS,
+  evaluateRevisionAcceptance,
+  formatLossPointDelta,
+  formatLossScore,
+  formatRiskScore,
+  hasSamePersonaIds,
+  lossLevel,
+  summarizeIndependentBatchScores,
+} from "../lib/launchLoss";
 
 const defaultRiskFocus = [
   "Clarity",
@@ -468,24 +481,17 @@ function ScoreCard({
   );
 }
 
-function formatLoss(value: number | null | undefined) {
-  if (typeof value !== "number" || Number.isNaN(value)) return "N/A";
-  return `${Math.round(value * 100)}%`;
-}
-
-function lossLevel(value: number | null | undefined) {
-  if (typeof value !== "number" || Number.isNaN(value)) return "Unknown";
-  if (value < 0.25) return "Low";
-  if (value < 0.45) return "Medium";
-  return "High";
-}
-
 function lossClass(value: number | null | undefined) {
   const level = lossLevel(value);
   if (level === "Low") return "text-emerald-700";
   if (level === "Medium") return "text-amber-700";
   if (level === "High") return "text-rose-700";
   return "text-slate-500";
+}
+
+function riskDriverLabel(label: string) {
+  const spaced = label.replace(/([A-Z])/g, " $1").trim();
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1).toLowerCase();
 }
 
 type LaunchLossChartBatch = {
@@ -507,28 +513,10 @@ type RevisionHistoryItem = {
   status: "accepted" | "candidate" | "rejected";
   reason: string;
   result: SimulationResponse;
+  fixedPersonaSet: boolean;
+  acceptanceReason?: string;
+  guardrailFailures?: string[];
 };
-
-const MIN_REVISION_IMPROVEMENT = 0.03;
-const TARGET_LAUNCH_LOSS = 0.25;
-const MAX_REVISION_ROUNDS = 3;
-
-function decisionRank(decision: string) {
-  if (decision === "Do not launch") return 2;
-  if (decision === "Revise before release") return 1;
-  return 0;
-}
-
-function keyRiskIncrease(
-  current: SimulationResponse,
-  candidate: SimulationResponse,
-) {
-  return Math.max(
-    candidate.privacyRisk - current.privacyRisk,
-    candidate.fairnessRisk - current.fairnessRisk,
-    candidate.accessibilityRisk - current.accessibilityRisk,
-  );
-}
 
 function lossFill(value: number | null | undefined) {
   if (typeof value !== "number" || Number.isNaN(value)) return "#cbd5e1";
@@ -542,11 +530,13 @@ function LaunchLossBatchChart({
   title,
   xLabel = "Batch",
   pointPrefix = "B",
+  mode = "personaBatches",
 }: {
   batches: LaunchLossChartBatch[];
   title: string;
   xLabel?: string;
   pointPrefix?: string;
+  mode?: "personaBatches" | "revisions";
 }) {
   if (!batches.length) return null;
 
@@ -558,17 +548,20 @@ function LaunchLossBatchChart({
   const bottom = 54;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const xFor = (index: number) =>
+  const xForLine = (index: number) =>
     batches.length === 1
       ? left + plotWidth / 2
       : left + (plotWidth * index) / (batches.length - 1);
+  const slotWidth = plotWidth / Math.max(1, batches.length);
+  const barWidth = Math.min(76, Math.max(34, slotWidth * 0.58));
+  const xForBar = (index: number) => left + slotWidth * index + slotWidth / 2;
   const yFor = (value: number) => top + plotHeight - value * plotHeight;
   const completedPoints = batches
     .map((batch, index) => ({ batch, index }))
     .filter(({ batch }) => typeof batch.launchLoss === "number")
     .map(({ batch, index }) => ({
       batch,
-      x: xFor(index),
+      x: xForLine(index),
       y: yFor(batch.launchLoss ?? 0),
     }));
   const linePath = completedPoints
@@ -580,17 +573,34 @@ function LaunchLossBatchChart({
     typeof first === "number" && typeof last === "number" && completedPoints.length > 1
       ? last - first
       : null;
+  const batchSummary = summarizeIndependentBatchScores(batches);
 
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-4">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
         <div className="text-sm font-bold text-slate-800">{title}</div>
-        {delta !== null ? (
+        {mode === "revisions" && delta !== null ? (
           <div className={`text-xs font-bold ${delta <= 0 ? "text-emerald-700" : "text-rose-700"}`}>
-            {delta <= 0 ? "Improved" : "Worse"} {formatLoss(Math.abs(delta))} from first completed batch
+            {delta <= 0 ? "Down" : "Up"} {formatLossPointDelta(delta)}
           </div>
         ) : null}
       </div>
+      {mode === "personaBatches" ? (
+        <div className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700 md:grid-cols-3">
+          <div className="font-semibold">{batchSummary.rangeLabel}</div>
+          <div className="font-semibold">{batchSummary.averageLabel}</div>
+          <div className="font-semibold">
+            Completed: {batchSummary.completedCount} persona groups
+          </div>
+          <div className="md:col-span-3 text-slate-600">
+            {batchSummary.consistencyLabel}
+          </div>
+          <div className="md:col-span-3 text-xs font-semibold text-slate-500">
+            How much the launch-risk score changes when the same campaign is
+            tested against different persona groups.
+          </div>
+        </div>
+      ) : null}
       <div className="mt-3 overflow-x-auto">
         <svg
           viewBox={`0 0 ${width} ${height}`}
@@ -616,7 +626,7 @@ function LaunchLossBatchChart({
                   textAnchor="end"
                   className="fill-slate-500 text-[11px] font-semibold"
                 >
-                  {Math.round(tick * 100)}%
+                  {Math.round(tick * 100)}
                 </text>
               </g>
             );
@@ -645,18 +655,19 @@ function LaunchLossBatchChart({
               strokeWidth="3"
               strokeLinecap="round"
               strokeLinejoin="round"
+              opacity={mode === "revisions" ? 1 : 0}
             />
           ) : null}
           {batches.map((batch, index) => {
             const hasLoss = typeof batch.launchLoss === "number";
-            const x = xFor(index);
+            const x = mode === "personaBatches" ? xForBar(index) : xForLine(index);
             const y = hasLoss ? yFor(batch.launchLoss ?? 0) : top + plotHeight;
             const isRunning = batch.status === "running";
             const isFailed = batch.status === "failed";
             const fill = isFailed ? "#dc2626" : isRunning ? "#123d73" : lossFill(batch.launchLoss);
             const label =
               hasLoss
-                ? `${formatLoss(batch.launchLoss)}${batch.overallDecision ? `, ${batch.overallDecision}` : ""}`
+                ? `${formatLossScore(batch.launchLoss)}${batch.overallDecision ? `, ${batch.overallDecision}` : ""}`
                 : batch.status ?? "queued";
             return (
               <g key={batch.batchIndex}>
@@ -668,19 +679,34 @@ function LaunchLossBatchChart({
                   stroke="#94a3b8"
                   strokeWidth="1.5"
                 />
-                <circle
-                  cx={x}
-                  cy={y}
-                  r={isRunning ? 8 : 7}
-                  fill={fill}
-                  stroke="#ffffff"
-                  strokeWidth="3"
-                >
-                  <title>
-                    {`Batch ${batch.batchIndex}, personas ${batch.personaStart}-${batch.personaEnd}: ${label}`}
-                  </title>
-                </circle>
-                {isRunning ? (
+                {mode === "personaBatches" ? (
+                  <rect
+                    x={x - barWidth / 2}
+                    y={y}
+                    width={barWidth}
+                    height={top + plotHeight - y}
+                    rx="6"
+                    fill={fill}
+                  >
+                    <title>
+                      {`Batch ${batch.batchIndex}, personas ${batch.personaStart}-${batch.personaEnd}: ${label}`}
+                    </title>
+                  </rect>
+                ) : (
+                  <circle
+                    cx={x}
+                    cy={y}
+                    r={isRunning ? 8 : 7}
+                    fill={fill}
+                    stroke="#ffffff"
+                    strokeWidth="3"
+                  >
+                    <title>
+                      {`Revision ${batch.batchIndex}: ${label}`}
+                    </title>
+                  </circle>
+                )}
+                {isRunning && mode === "revisions" ? (
                   <circle
                     cx={x}
                     cy={y}
@@ -694,11 +720,11 @@ function LaunchLossBatchChart({
                 {hasLoss ? (
                   <text
                     x={x}
-                    y={y - 13}
+                    y={mode === "personaBatches" ? y - 9 : y - 13}
                     textAnchor="middle"
                     className="fill-slate-800 text-[11px] font-bold"
                   >
-                    {formatLoss(batch.launchLoss)}
+                    {formatLossScore(batch.launchLoss)}
                   </text>
                 ) : null}
                 <text
@@ -735,7 +761,7 @@ function LaunchLossBatchChart({
             transform={`rotate(-90 18 ${top + plotHeight / 2})`}
             className="fill-slate-500 text-[11px] font-bold"
           >
-            Launch loss
+            Launch loss score
           </text>
         </svg>
       </div>
@@ -778,20 +804,22 @@ function LaunchLossHelp() {
         >
           <div className="font-bold text-slate-950">What is launch loss?</div>
           <p className="mt-2">
-            Launch loss estimates how risky it is to launch this campaign as-is.
-            Lower is better.
+            A directional risk score derived from synthetic persona simulations.
+            It is not a prediction of real-world campaign failure or a
+            substitute for compliance review and customer testing.
           </p>
           <div className="mt-3 grid gap-2 text-xs font-semibold text-slate-600">
-            <div>0-25%: Low risk</div>
-            <div>25-45%: Medium risk</div>
-            <div>45%+: High risk</div>
+            <div>0-25/100: Low risk</div>
+            <div>25-45/100: Medium risk</div>
+            <div>45+/100: High risk</div>
           </div>
           <p className="mt-3">
             It combines clarity loss, trust loss, stress, fairness,
             accessibility, privacy, operational, and financial wellbeing risk.
           </p>
           <p className="mt-3 text-xs font-semibold text-slate-500">
-            Batch trend shows which persona batch increased or reduced risk.
+            Persona batch scores show score variation across independent
+            synthetic persona groups.
           </p>
           <button
             type="button"
@@ -813,12 +841,7 @@ function LaunchLossPanel({ result }: { result: SimulationResponse }) {
     .sort(([, a], [, b]) => b - a)
     .slice(0, 4);
   const batchLosses = result.batchLaunchLosses ?? [];
-  const firstBatch = batchLosses[0]?.launchLoss;
-  const lastBatch = batchLosses[batchLosses.length - 1]?.launchLoss;
-  const delta =
-    typeof firstBatch === "number" && typeof lastBatch === "number"
-      ? lastBatch - firstBatch
-      : null;
+  const level = lossLevel(result.launchLoss);
 
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
@@ -826,51 +849,57 @@ function LaunchLossPanel({ result }: { result: SimulationResponse }) {
         <div>
           <div className="flex items-center gap-2">
             <AlertTriangle className={`h-5 w-5 ${lossClass(result.launchLoss)}`} />
-            <h2 className="text-lg font-bold text-slate-950">Launch loss</h2>
+            <h2 className="text-lg font-bold text-slate-950">
+              Launch loss: {formatLossScore(result.launchLoss)} - {level}
+            </h2>
             <LaunchLossHelp />
-            <Badge value={lossLevel(result.launchLoss)} />
+            <Badge value={level} />
           </div>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-            Weighted risk objective from clarity, trust, stress, fairness,
-            accessibility, privacy, operational, and financial wellbeing signals.
+            Directional launch-risk score across clarity, trust, stress,
+            fairness, accessibility, privacy, operational and financial
+            wellbeing signals.
           </p>
         </div>
         <div className="text-left lg:text-right">
           <div className={`text-4xl font-black ${lossClass(result.launchLoss)}`}>
-            {formatLoss(result.launchLoss)}
+            {formatLossScore(result.launchLoss)}
           </div>
-          {delta !== null && batchLosses.length > 1 ? (
-            <div className="mt-1 text-sm font-semibold text-slate-500">
-              {delta <= 0 ? "Down" : "Up"} {formatLoss(Math.abs(delta))} from batch 1
-            </div>
-          ) : null}
         </div>
       </div>
 
       {breakdown.length ? (
-        <div className="mt-5 grid gap-3 md:grid-cols-4">
-          {breakdown.map(([label, value]) => (
-            <div key={label} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
-                {label.replace(/([A-Z])/g, " $1")}
+        <div className="mt-5">
+          <div className="text-sm font-bold text-slate-800">
+            Main risk drivers, highest to lowest
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-4">
+            {breakdown.map(([label, value]) => (
+              <div key={label} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                  {riskDriverLabel(label)}
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                  <div
+                    className="h-full rounded-full bg-bnz-600"
+                    style={{ width: `${Math.max(4, Math.round(value * 100))}%` }}
+                  />
+                </div>
+                <div className="mt-2 text-sm font-bold text-slate-900">
+                  {formatRiskScore(riskDriverLabel(label), value)}
+                </div>
               </div>
-              <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
-                <div
-                  className="h-full rounded-full bg-bnz-600"
-                  style={{ width: `${Math.max(4, Math.round(value * 100))}%` }}
-                />
-              </div>
-              <div className="mt-2 text-sm font-bold text-slate-900">
-                {formatLoss(value)}
-              </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       ) : null}
 
       {batchLosses.length ? (
         <div className="mt-5">
-          <LaunchLossBatchChart batches={batchLosses} title="Batch trend" />
+          <LaunchLossBatchChart
+            batches={batchLosses}
+            title="Risk across persona batches"
+          />
         </div>
       ) : null}
     </div>
@@ -883,7 +912,13 @@ function MessageOptimizerPanel({
   optimizing,
   autoAccept,
   onAutoAcceptChange,
-  onEvaluateBetterMessage,
+  maxIterations,
+  onMaxIterationsChange,
+  minImprovement,
+  onMinImprovementChange,
+  targetLoss,
+  onTargetLossChange,
+  onRunOptimization,
   onAcceptRevision,
   simulationProgress,
 }: {
@@ -892,25 +927,39 @@ function MessageOptimizerPanel({
   optimizing: boolean;
   autoAccept: boolean;
   onAutoAcceptChange: (value: boolean) => void;
-  onEvaluateBetterMessage: () => void;
+  maxIterations: number;
+  onMaxIterationsChange: (value: number) => void;
+  minImprovement: number;
+  onMinImprovementChange: (value: number) => void;
+  targetLoss: number;
+  onTargetLossChange: (value: number) => void;
+  onRunOptimization: () => void;
   onAcceptRevision: (item: RevisionHistoryItem) => void;
   simulationProgress: SimulationJobStatusResponse | null;
 }) {
   const acceptedRounds = revisionHistory.filter((item) => item.status === "accepted").length;
   const currentLoss = result.launchLoss ?? null;
   const stopReasons = [
-    currentLoss !== null && currentLoss <= TARGET_LAUNCH_LOSS
+    currentLoss !== null && currentLoss <= targetLoss
       ? "Target launch loss reached."
       : null,
-    acceptedRounds > MAX_REVISION_ROUNDS
+    acceptedRounds > maxIterations
       ? "Maximum revision rounds reached."
       : null,
-    !result.betterMessage.trim() ? "No revised message candidate is available." : null,
   ].filter(Boolean);
   const canEvaluate = !optimizing && !stopReasons.length;
   const latestCandidate = [...revisionHistory]
     .reverse()
     .find((item) => item.status === "candidate");
+  const latestCandidateAcceptance = latestCandidate
+    ? evaluateRevisionAcceptance({
+        current: result,
+        candidate: latestCandidate.result,
+        minImprovement,
+        fixedPersonaSet: latestCandidate.fixedPersonaSet,
+      })
+    : null;
+  const canAcceptLatest = Boolean(latestCandidate && latestCandidateAcceptance?.accepted);
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
@@ -921,12 +970,12 @@ function MessageOptimizerPanel({
             Message optimizer
           </div>
           <h2 className="mt-2 text-lg font-bold text-slate-950">
-            Loss-guided revision loop
+            Optimization run
           </h2>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-            Evaluate the suggested better message on the same persona set, then
-            accept it only when launch loss improves enough and key risks do not
-            worsen.
+            Run a training-style generate, simulate, accept-or-reject loop on
+            the same persona set. Each accepted revision becomes the next base
+            message.
           </p>
         </div>
         <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700">
@@ -936,31 +985,81 @@ function MessageOptimizerPanel({
             onChange={(event) => onAutoAcceptChange(event.target.checked)}
             className="h-4 w-4 rounded border-slate-300 text-bnz-700 focus:ring-bnz-500"
           />
-          Auto-accept improved revisions
+          Auto-accept passing revisions
         </label>
       </div>
 
-      <div className="mt-4 grid gap-3 md:grid-cols-4">
+      <div className="mt-4 grid gap-3 md:grid-cols-5">
         <ScoreCard
           label="Current loss"
-          value={formatLoss(currentLoss)}
+          value={formatLossScore(currentLoss)}
           detail="Measured on the fixed persona set."
         />
         <ScoreCard
           label="Target"
-          value={formatLoss(TARGET_LAUNCH_LOSS)}
+          value={`≤ ${formatLossScore(targetLoss)}`}
           detail="Stop when loss is low enough."
         />
         <ScoreCard
           label="Min improvement"
-          value={formatLoss(MIN_REVISION_IMPROVEMENT)}
+          value={formatLossPointDelta(minImprovement)}
           detail="Reject tiny/noisy gains."
         />
         <ScoreCard
-          label="Max rounds"
-          value={`${MAX_REVISION_ROUNDS}`}
+          label="Max iterations"
+          value={`${maxIterations}`}
           detail="Controls cost and drift."
         />
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
+          <div className="text-sm font-medium text-slate-500">Run settings</div>
+          <div className="mt-3 grid gap-2">
+            <label className="grid gap-1 text-xs font-bold text-slate-600">
+              Iterations
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={maxIterations}
+                onChange={(event) =>
+                  onMaxIterationsChange(
+                    Math.max(1, Math.min(10, Number(event.target.value) || 1)),
+                  )
+                }
+                className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+              />
+            </label>
+            <label className="grid gap-1 text-xs font-bold text-slate-600">
+              Min points
+              <input
+                type="number"
+                min={0}
+                max={25}
+                value={Math.round(minImprovement * 100)}
+                onChange={(event) =>
+                  onMinImprovementChange(
+                    Math.max(0, Math.min(25, Number(event.target.value) || 0)) / 100,
+                  )
+                }
+                className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+              />
+            </label>
+            <label className="grid gap-1 text-xs font-bold text-slate-600">
+              Target score
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={Math.round(targetLoss * 100)}
+                onChange={(event) =>
+                  onTargetLossChange(
+                    Math.max(0, Math.min(100, Number(event.target.value) || 0)) / 100,
+                  )
+                }
+                className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+              />
+            </label>
+          </div>
+        </div>
       </div>
 
       {stopReasons.length ? (
@@ -973,20 +1072,40 @@ function MessageOptimizerPanel({
         <button
           type="button"
           disabled={!canEvaluate}
-          onClick={onEvaluateBetterMessage}
+          onClick={onRunOptimization}
           className="focus-ring inline-flex items-center gap-2 rounded-lg bg-bnz-700 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-bnz-900 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {optimizing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-          {optimizing ? "Evaluating revision" : "Evaluate better message"}
+          {optimizing ? "Running optimization" : "Run optimization"}
         </button>
         {latestCandidate ? (
-          <button
-            type="button"
-            onClick={() => onAcceptRevision(latestCandidate)}
-            className="focus-ring rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-bold text-emerald-700 hover:bg-white"
-          >
-            Accept latest candidate
-          </button>
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              disabled={!canAcceptLatest}
+              onClick={() => {
+                if (canAcceptLatest) onAcceptRevision(latestCandidate);
+              }}
+              className="focus-ring rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-bold text-emerald-700 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Accept latest candidate
+            </button>
+            {!canAcceptLatest && latestCandidateAcceptance ? (
+              <div className="max-w-md rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs font-semibold leading-5 text-rose-800">
+                <div>{latestCandidateAcceptance.reason}</div>
+                <div>
+                  Minimum required improvement:{" "}
+                  {formatLossPointDelta(minImprovement)}
+                </div>
+                {latestCandidateAcceptance.guardrailFailures.length ? (
+                  <div>
+                    Guardrail failed:{" "}
+                    {latestCandidateAcceptance.guardrailFailures.join(", ")}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         ) : null}
       </div>
 
@@ -1002,6 +1121,7 @@ function MessageOptimizerPanel({
             title="Revision loss trend"
             xLabel="Revision"
             pointPrefix="R"
+            mode="revisions"
             batches={revisionHistory.map((item, index) => ({
               batchIndex: index + 1,
               personaStart: index + 1,
@@ -1028,10 +1148,15 @@ function MessageOptimizerPanel({
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <Badge value={item.status} />
-                    <Badge value={formatLoss(item.launchLoss)} />
+                    <Badge value={formatLossScore(item.launchLoss)} />
                     <Badge value={item.overallDecision} />
                   </div>
                 </div>
+                {item.acceptanceReason ? (
+                  <div className="mt-2 text-xs font-semibold text-slate-500">
+                    {item.acceptanceReason}
+                  </div>
+                ) : null}
                 <p className="mt-3 rounded-lg border border-slate-200 bg-white p-3 text-sm leading-6 text-slate-700">
                   {item.message}
                 </p>
@@ -3028,7 +3153,13 @@ function Results({
   optimizingRevision,
   autoAcceptRevisions,
   onAutoAcceptRevisionsChange,
-  onEvaluateBetterMessage,
+  maxOptimizationIterations,
+  onMaxOptimizationIterationsChange,
+  minOptimizationImprovement,
+  onMinOptimizationImprovementChange,
+  targetOptimizationLoss,
+  onTargetOptimizationLossChange,
+  onRunOptimization,
   onAcceptRevision,
   simulationProgress,
 }: {
@@ -3037,7 +3168,13 @@ function Results({
   optimizingRevision: boolean;
   autoAcceptRevisions: boolean;
   onAutoAcceptRevisionsChange: (value: boolean) => void;
-  onEvaluateBetterMessage: () => void;
+  maxOptimizationIterations: number;
+  onMaxOptimizationIterationsChange: (value: number) => void;
+  minOptimizationImprovement: number;
+  onMinOptimizationImprovementChange: (value: number) => void;
+  targetOptimizationLoss: number;
+  onTargetOptimizationLossChange: (value: number) => void;
+  onRunOptimization: () => void;
   onAcceptRevision: (item: RevisionHistoryItem) => void;
   simulationProgress: SimulationJobStatusResponse | null;
 }) {
@@ -3105,7 +3242,13 @@ function Results({
         optimizing={optimizingRevision}
         autoAccept={autoAcceptRevisions}
         onAutoAcceptChange={onAutoAcceptRevisionsChange}
-        onEvaluateBetterMessage={onEvaluateBetterMessage}
+        maxIterations={maxOptimizationIterations}
+        onMaxIterationsChange={onMaxOptimizationIterationsChange}
+        minImprovement={minOptimizationImprovement}
+        onMinImprovementChange={onMinOptimizationImprovementChange}
+        targetLoss={targetOptimizationLoss}
+        onTargetLossChange={onTargetOptimizationLossChange}
+        onRunOptimization={onRunOptimization}
         onAcceptRevision={onAcceptRevision}
         simulationProgress={simulationProgress}
       />
@@ -3470,6 +3613,12 @@ export default function App() {
   const [simulating, setSimulating] = useState(false);
   const [optimizingRevision, setOptimizingRevision] = useState(false);
   const [autoAcceptRevisions, setAutoAcceptRevisions] = useState(false);
+  const [maxOptimizationIterations, setMaxOptimizationIterations] =
+    useState(MAX_REVISION_ROUNDS);
+  const [minOptimizationImprovement, setMinOptimizationImprovement] =
+    useState(MIN_REVISION_IMPROVEMENT);
+  const [targetOptimizationLoss, setTargetOptimizationLoss] =
+    useState(TARGET_LAUNCH_LOSS);
   const [revisionHistory, setRevisionHistory] = useState<RevisionHistoryItem[]>([]);
   const [simulationProgress, setSimulationProgress] =
     useState<SimulationJobStatusResponse | null>(null);
@@ -3693,6 +3842,7 @@ export default function App() {
           status: "accepted",
           reason: "Initial message simulation.",
           result: simulation,
+          fixedPersonaSet: true,
         },
       ]);
       setSimulationProgress(null);
@@ -3709,105 +3859,151 @@ export default function App() {
     }
   }
 
-  async function onEvaluateBetterMessage() {
+  async function onRunOptimization() {
     if (!result) return;
-    const currentLoss = result.launchLoss;
-    if (typeof currentLoss !== "number") {
+    if (typeof result.launchLoss !== "number") {
       setError("Run a simulation with launch loss before optimizing the message.");
       return;
     }
-    if (currentLoss <= TARGET_LAUNCH_LOSS) {
+    if (result.launchLoss <= targetOptimizationLoss) {
       setError("Stop condition reached: launch loss is already low enough.");
-      return;
-    }
-    const acceptedRounds = revisionHistory.filter(
-      (item) => item.status === "accepted",
-    ).length;
-    if (acceptedRounds > MAX_REVISION_ROUNDS) {
-      setError("Stop condition reached: maximum revision rounds reached.");
-      return;
-    }
-    const candidateMessage = result.betterMessage.trim();
-    if (!candidateMessage) {
-      setError("No better message candidate is available.");
-      return;
-    }
-    if (candidateMessage === form.customerFacingCopy.trim()) {
-      setError("The suggested better message is the same as the current message.");
       return;
     }
 
     const requestSequence = latestSimulationRequestRef.current + 1;
     latestSimulationRequestRef.current = requestSequence;
-    const revisionIndex = revisionHistory.length + 1;
-    const candidateForm = {
-      ...form,
-      customerFacingCopy: candidateMessage,
-    };
+    const fixedPersonas = personas.length ? personas : selectedPersonas.map(toGeneratedPersona);
+    const previousMessages = new Set(revisionHistory.map((item) => item.message.trim()));
+    let bestResult = result;
+    let bestMessage = form.customerFacingCopy.trim();
+    let workingForm = { ...form, customerFacingCopy: bestMessage };
+    let workingHistory = [...revisionHistory];
     setOptimizingRevision(true);
     setSimulationProgress(null);
     setError(null);
     try {
-      const candidateResult = await runSimulation(
-        candidateForm,
-        personas,
-        (progress) => {
-          if (requestSequence === latestSimulationRequestRef.current) {
-            setSimulationProgress(progress);
-          }
-        },
-      );
-      if (requestSequence !== latestSimulationRequestRef.current) return;
+      for (let iteration = 1; iteration <= maxOptimizationIterations; iteration += 1) {
+        if (requestSequence !== latestSimulationRequestRef.current) return;
+        if (
+          typeof bestResult.launchLoss === "number" &&
+          bestResult.launchLoss <= targetOptimizationLoss
+        ) {
+          break;
+        }
 
-      const newLoss = candidateResult.launchLoss ?? 1;
-      const improvement = currentLoss - newLoss;
-      const worsenedDecision =
-        decisionRank(candidateResult.overallDecision) > decisionRank(result.overallDecision);
-      const riskIncrease = keyRiskIncrease(result, candidateResult);
-      const autoAccepted =
-        autoAcceptRevisions &&
-        improvement >= MIN_REVISION_IMPROVEMENT &&
-        !worsenedDecision &&
-        riskIncrease < 10;
-      const status: RevisionHistoryItem["status"] = autoAccepted
-        ? "accepted"
-        : improvement <= 0 || worsenedDecision || riskIncrease >= 10
-          ? "rejected"
-          : "candidate";
-      const reason = autoAccepted
-        ? `Auto-accepted: launch loss improved by ${formatLoss(improvement)}.`
-        : improvement < MIN_REVISION_IMPROVEMENT
-          ? `Not auto-accepted: improvement was below ${formatLoss(MIN_REVISION_IMPROVEMENT)}.`
-          : worsenedDecision
-            ? "Rejected: launch decision worsened."
-            : riskIncrease >= 10
-              ? "Rejected: privacy, fairness, or accessibility risk increased by 10+ points."
-              : "Candidate evaluated. Review before accepting.";
+        const revision = await generateRevision({
+          campaignInput: advisorCampaignInput(workingForm),
+          personas: fixedPersonas,
+          currentResult: advisorSimulationResult(bestResult),
+          bestMessage,
+          previousCandidates: workingHistory.map((item) => ({
+            label: item.label,
+            message: item.message,
+            launchLoss: item.launchLoss,
+            status: item.status,
+            reason: item.reason,
+          })),
+          iteration,
+          targetLaunchLoss: targetOptimizationLoss,
+          minImprovement: minOptimizationImprovement,
+        });
+        if (requestSequence !== latestSimulationRequestRef.current) return;
 
-      const historyItem: RevisionHistoryItem = {
-        id: `revision-${Date.now()}`,
-        label: `Revision ${revisionIndex}`,
-        message: candidateMessage,
-        launchLoss: candidateResult.launchLoss ?? null,
-        overallDecision: candidateResult.overallDecision,
-        status,
-        reason,
-        result: candidateResult,
-      };
-      setRevisionHistory((current) => [...current, historyItem]);
-      if (autoAccepted) {
-        setForm((current) => ({
-          ...current,
+        const generatedMessage = revision.candidate.message.trim();
+        const duplicateMessage = previousMessages.has(generatedMessage);
+        const candidateMessage =
+          generatedMessage || bestResult.betterMessage.trim() || bestMessage;
+        const candidateForm = {
+          ...workingForm,
           customerFacingCopy: candidateMessage,
-        }));
-        setResult(candidateResult);
-        setInputsChanged(false);
+        };
+
+        let historyItem: RevisionHistoryItem;
+        if (duplicateMessage) {
+          previousMessages.add(candidateMessage);
+          historyItem = {
+            id: `revision-${Date.now()}-${iteration}`,
+            label: `Revision ${workingHistory.length}`,
+            message: candidateMessage,
+            launchLoss: bestResult.launchLoss ?? null,
+            overallDecision: bestResult.overallDecision,
+            status: "rejected",
+            reason: "Candidate rejected - duplicate message from a previous iteration.",
+            result: bestResult,
+            fixedPersonaSet: true,
+            acceptanceReason: "Candidate rejected because optimization reused an earlier message.",
+            guardrailFailures: ["duplicate message"],
+          };
+          workingHistory = [...workingHistory, historyItem];
+          setRevisionHistory(workingHistory);
+          continue;
+        }
+
+        const candidateResult = await runSimulation(
+          candidateForm,
+          fixedPersonas,
+          (progress) => {
+            if (requestSequence === latestSimulationRequestRef.current) {
+              setSimulationProgress(progress);
+            }
+          },
+        );
+        if (requestSequence !== latestSimulationRequestRef.current) return;
+
+        previousMessages.add(candidateMessage);
+        const newLoss = candidateResult.launchLoss ?? 1;
+        const improvement = (bestResult.launchLoss ?? 1) - newLoss;
+        const fixedPersonaSet = hasSamePersonaIds(fixedPersonas, candidateResult);
+        const acceptance = evaluateRevisionAcceptance({
+          current: bestResult,
+          candidate: candidateResult,
+          minImprovement: minOptimizationImprovement,
+          fixedPersonaSet,
+        });
+        const accepted = autoAcceptRevisions && acceptance.accepted;
+        const status: RevisionHistoryItem["status"] = accepted
+          ? "accepted"
+          : !acceptance.accepted
+            ? "rejected"
+            : "candidate";
+        const reason = accepted
+          ? `Auto-accepted: ${acceptance.reason}`
+          : acceptance.accepted
+            ? "Candidate evaluated. Review before accepting."
+            : acceptance.reason;
+
+        historyItem = {
+          id: `revision-${Date.now()}-${iteration}`,
+          label: `Revision ${workingHistory.length}`,
+          message: candidateMessage,
+          launchLoss: candidateResult.launchLoss ?? null,
+          overallDecision: candidateResult.overallDecision,
+          status,
+          reason,
+          result: candidateResult,
+          fixedPersonaSet,
+          acceptanceReason: acceptance.accepted
+            ? `Improved by ${formatLossPointDelta(improvement)} from the original message. ${revision.candidate.rationale}`
+            : `${acceptance.reason}. Minimum required improvement: ${formatLossPointDelta(minOptimizationImprovement)}. ${revision.candidate.rationale}`,
+          guardrailFailures: acceptance.guardrailFailures,
+        };
+        workingHistory = [...workingHistory, historyItem];
+        setRevisionHistory(workingHistory);
+
+        if (accepted) {
+          bestResult = candidateResult;
+          bestMessage = candidateMessage;
+          workingForm = candidateForm;
+          setForm(candidateForm);
+          setResult(candidateResult);
+          setInputsChanged(false);
+        }
       }
       setSimulationProgress(null);
     } catch (err) {
       if (requestSequence === latestSimulationRequestRef.current) {
         setError(
-          err instanceof Error ? err.message : "Revision evaluation failed",
+          err instanceof Error ? err.message : "Optimization failed",
         );
       }
     } finally {
@@ -4383,7 +4579,13 @@ export default function App() {
                   optimizingRevision={optimizingRevision}
                   autoAcceptRevisions={autoAcceptRevisions}
                   onAutoAcceptRevisionsChange={setAutoAcceptRevisions}
-                  onEvaluateBetterMessage={() => void onEvaluateBetterMessage()}
+                  maxOptimizationIterations={maxOptimizationIterations}
+                  onMaxOptimizationIterationsChange={setMaxOptimizationIterations}
+                  minOptimizationImprovement={minOptimizationImprovement}
+                  onMinOptimizationImprovementChange={setMinOptimizationImprovement}
+                  targetOptimizationLoss={targetOptimizationLoss}
+                  onTargetOptimizationLossChange={setTargetOptimizationLoss}
+                  onRunOptimization={() => void onRunOptimization()}
                   onAcceptRevision={onAcceptRevision}
                   simulationProgress={simulationProgress}
                 />

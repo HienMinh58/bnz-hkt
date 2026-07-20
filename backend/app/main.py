@@ -26,6 +26,9 @@ from app.models import (
     GeneratedPersona,
     LegacyPersona,
     BatchLaunchLoss,
+    RevisionCandidate,
+    RevisionGenerationRequest,
+    RevisionGenerationResponse,
     SimulationBatchProgress,
     SegmentFitSummary,
     DevelopmentDebug,
@@ -36,6 +39,7 @@ from app.models import (
 from app.openai_client import (
     advise_on_simulation_with_openai,
     derive_ad_analysis_from_segments_with_openai,
+    generate_revision_with_openai,
     generate_synthetic_feature_profiles_with_openai,
     generate_personas_with_openai,
     simulate_with_openai,
@@ -364,6 +368,57 @@ def advisor_chat(
             request_id=request_id,
             duration_ms=duration_ms,
             fallback_reason=fallback_reason,
+        )
+
+
+@app.post("/api/generate-revision", response_model=RevisionGenerationResponse)
+def generate_revision(
+    request: RevisionGenerationRequest,
+    _user: AuthenticatedUser = Depends(require_authenticated_user),
+) -> RevisionGenerationResponse:
+    request_id = uuid4().hex
+    started_at = time.perf_counter()
+    logger.info(
+        "generate_revision_request_received requestId=%s timestamp=%s iteration=%s",
+        request_id,
+        _utc_timestamp(),
+        request.iteration,
+    )
+    try:
+        result = generate_revision_with_openai(request, request_id=request_id)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.info(
+            "generate_revision_response_returned requestId=%s timestamp=%s "
+            "durationMs=%s usedOpenAI=%s",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            result.used_openai,
+        )
+        return result.model_copy(update={"requestId": request_id, "durationMs": duration_ms})
+    except Exception as exc:
+        fallback_reason = normalize_fallback_reason(exc)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.exception(
+            "generate_revision_failed requestId=%s timestamp=%s durationMs=%s error=%s",
+            request_id,
+            _utc_timestamp(),
+            duration_ms,
+            fallback_reason,
+        )
+        fallback_message = request.currentResult.betterMessage.strip() or request.bestMessage
+        return RevisionGenerationResponse(
+            candidate=RevisionCandidate(
+                message=fallback_message,
+                rationale=(
+                    "Local fallback used the latest simulation betterMessage because "
+                    "the AI revision generator was unavailable."
+                ),
+            ),
+            used_openai=False,
+            fallback_reason=fallback_reason,
+            requestId=request_id,
+            durationMs=duration_ms,
         )
 
 
